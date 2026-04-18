@@ -12,7 +12,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <mosquitto.h>
 #include <wsserver/ws.h>
 
@@ -82,11 +81,10 @@ void onmessage(ws_cli_conn_t client,
 static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
     (void)ud;
     if (rc != 0) {
-        fprintf(stderr, "[MQTT] Connect failed rc=%d\n", rc);
+        fprintf(stderr, "[MQTT] Connect failed rc=%d (%s)\n",
+                rc, mosquitto_strerror(rc));
         return;
     }
-    /* TCP timeout이 g_need_failover=1을 세운 직후 on_connect가
-     * 도착할 수 있으므로 여기서 클리어한다. */
     g_need_failover = 0;
     pthread_mutex_lock(&g_mutex);
     g_connected = 1;
@@ -148,7 +146,7 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 콜백 설정 — 인스턴스 생성 후 공통 초기화
+ * 콜백 설정
  * ───────────────────────────────────────────────────────────── */
 static void setup_callbacks(struct mosquitto *mosq) {
     mosquitto_connect_callback_set(mosq, on_mqtt_connect);
@@ -157,23 +155,24 @@ static void setup_callbacks(struct mosquitto *mosq) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * mosq_stop — 소켓 강제 종료 후 loop_stop
+ * mosq_stop — 네트워크 스레드 강제 종료
  *
- * mosquitto_disconnect()는 connect_pending 상태(TCP SYN 전송 후 대기)일 때
+ * mosquitto_disconnect()는 connect_pending 상태(TCP SYN 대기)일 때
  * 소켓을 닫지 않고 MOSQ_ERR_NO_CONN을 반환한다.
- * 이 경우 loop_stop이 select()에서 무기한 블로킹된다.
+ * loop_stop(false)만 쓰면 select()가 블로킹되어 수십 초 대기한다.
  *
- * shutdown(SHUT_RDWR)으로 소켓을 먼저 강제 종료하면:
- *   → select()가 즉시 오류 반환
- *   → mosquitto_loop()가 에러 코드 반환
- *   → 네트워크 스레드 자연 종료
- *   → loop_stop(false)가 빠르게 리턴 (pthread_cancel 없음 → mutex 안전)
+ * loop_stop(true): pthread_cancel로 스레드 강제 종료 후 pthread_join.
+ * 취소된 스레드가 보유한 mutex는 per-instance이므로,
+ * 바로 뒤에 mosquitto_destroy로 인스턴스를 소멸시키면 안전하다.
+ *
+ * shutdown(sock)을 쓰지 않는 이유:
+ * shutdown이 소켓을 강제 닫으면 mosquitto 내부에서 close(fd)를 중복
+ * 호출하거나, 새 소켓이 같은 fd 번호를 재사용해 connect_async에서
+ * MOSQ_ERR_ERRNO(rc=14) 오류가 발생할 수 있다.
  * ───────────────────────────────────────────────────────────── */
 static void mosq_stop(struct mosquitto *mosq) {
-    int sock = mosquitto_socket(mosq);
-    if (sock >= 0) shutdown(sock, SHUT_RDWR);
-    mosquitto_disconnect(mosq);
-    mosquitto_loop_stop(mosq, false);
+    mosquitto_disconnect(mosq);      /* MQTT DISCONNECT 시도 (connect_pending이면 no-op) */
+    mosquitto_loop_stop(mosq, true); /* pthread_cancel + pthread_join — 즉시 종료 보장 */
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -202,8 +201,8 @@ static void do_failover(void) {
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[Failover] connect_async to %s rc=%d, will retry\n",
-                BROKERS[g_broker_idx].label, rc);
+        fprintf(stderr, "[Failover] connect_async to %s rc=%d (%s)\n",
+                BROKERS[g_broker_idx].label, rc, mosquitto_strerror(rc));
         g_connect_start = 0;
         g_need_failover = 1;
         return;
@@ -235,7 +234,8 @@ int main(void) {
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[MQTT] Initial connect_async rc=%d\n", rc);
+        fprintf(stderr, "[MQTT] Initial connect_async rc=%d (%s)\n",
+                rc, mosquitto_strerror(rc));
         g_broker_idx = BROKER_COUNT - 1;
         g_need_failover = 1;
     } else {

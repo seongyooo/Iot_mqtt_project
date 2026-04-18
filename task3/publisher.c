@@ -12,7 +12,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
-#include <sys/socket.h>
 #include <sqlite3.h>
 #include <mosquitto.h>
 
@@ -69,7 +68,7 @@ static struct mosquitto *g_mosq         = NULL;
 static sqlite3         *g_db            = NULL;
 
 /* ─────────────────────────────────────────────────────────────
- * SQLite 큐 — 브로커 전부 다운 시 이벤트 로컬 저장
+ * SQLite 큐
  * ───────────────────────────────────────────────────────────── */
 static int db_init(void)
 {
@@ -132,8 +131,6 @@ static void on_connect(struct mosquitto *mosq, void *ud, int rc)
 {
     (void)ud;
     if (rc == 0) {
-        /* TCP timeout이 g_need_failover=1을 세운 직후 on_connect가
-         * 도착할 수 있으므로 여기서 클리어한다. */
         g_need_failover = 0;
         pthread_mutex_lock(&g_mutex);
         g_connected = 1;
@@ -163,7 +160,7 @@ static void on_disconnect(struct mosquitto *mosq, void *ud, int rc)
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 콜백 / LWT 설정 — 인스턴스 생성 후 공통 초기화
+ * 콜백 / LWT 설정
  * ───────────────────────────────────────────────────────────── */
 static void setup_callbacks(struct mosquitto *mosq)
 {
@@ -173,24 +170,21 @@ static void setup_callbacks(struct mosquitto *mosq)
 }
 
 /* ─────────────────────────────────────────────────────────────
- * mosq_stop — 소켓 강제 종료 후 loop_stop
+ * mosq_stop — 네트워크 스레드 강제 종료
  *
- * mosquitto_disconnect()는 connect_pending 상태(TCP SYN 전송 후 대기)일 때
+ * mosquitto_disconnect()는 connect_pending 상태(TCP SYN 대기)일 때
  * 소켓을 닫지 않고 MOSQ_ERR_NO_CONN을 반환한다.
- * 이 경우 loop_stop이 select()에서 무기한 블로킹된다.
+ * loop_stop(false)만 쓰면 select()가 블로킹되어 수십 초 대기한다.
  *
- * shutdown(SHUT_RDWR)으로 소켓을 먼저 강제 종료하면:
- *   → select()가 즉시 오류 반환
- *   → mosquitto_loop()가 에러 코드 반환
- *   → 네트워크 스레드 자연 종료
- *   → loop_stop(false)가 빠르게 리턴 (pthread_cancel 없음 → mutex 안전)
+ * loop_stop(true): pthread_cancel로 스레드 강제 종료 후 pthread_join.
+ * 취소된 스레드가 보유한 mutex는 per-instance이므로,
+ * 바로 뒤에 mosquitto_destroy로 인스턴스를 소멸시키면 안전하다.
+ * (글로벌 mutex를 보유한 상태로 취소될 위험이 없음)
  * ───────────────────────────────────────────────────────────── */
 static void mosq_stop(struct mosquitto *mosq)
 {
-    int sock = mosquitto_socket(mosq);
-    if (sock >= 0) shutdown(sock, SHUT_RDWR); /* select() 즉시 해제 */
-    mosquitto_disconnect(mosq);               /* 가능하면 MQTT DISCONNECT 전송 */
-    mosquitto_loop_stop(mosq, false);         /* pthread_cancel 없이 자연 종료 대기 */
+    mosquitto_disconnect(mosq);      /* MQTT DISCONNECT 시도 (connect_pending이면 no-op) */
+    mosquitto_loop_stop(mosq, true); /* pthread_cancel + pthread_join — 즉시 종료 보장 */
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -220,8 +214,8 @@ static void do_failover(void)
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[Failover] connect_async to %s rc=%d, will retry\n",
-                BROKERS[g_broker_idx].label, rc);
+        fprintf(stderr, "[Failover] connect_async to %s rc=%d (%s)\n",
+                BROKERS[g_broker_idx].label, rc, mosquitto_strerror(rc));
         g_connect_start = 0;
         g_need_failover = 1;
         return;
@@ -248,8 +242,8 @@ static struct mosquitto *mqtt_init(void)
                    BROKERS[i].host, BROKERS[i].label);
             break;
         }
-        fprintf(stderr, "[MQTT] %s (%s) connect_async failed rc=%d\n",
-                BROKERS[i].host, BROKERS[i].label, rc);
+        fprintf(stderr, "[MQTT] %s (%s) connect_async failed rc=%d (%s)\n",
+                BROKERS[i].host, BROKERS[i].label, rc, mosquitto_strerror(rc));
     }
     mosquitto_loop_start(mosq);
     return mosq;
@@ -285,7 +279,6 @@ static FILE *open_camera_pipe(void)
 
 /* ─────────────────────────────────────────────────────────────
  * MJPEG 스트림 → JPEG 프레임 1개 파싱
- *   SOI: 0xFF 0xD8 / EOI: 0xFF 0xD9
  * ───────────────────────────────────────────────────────────── */
 static uint8_t *read_jpeg_frame(FILE *pipe, size_t *out_size)
 {
@@ -319,7 +312,7 @@ static uint8_t *read_jpeg_frame(FILE *pipe, size_t *out_size)
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 모션 감지 — 연속 프레임 임계값 방식
+ * 모션 감지
  * ───────────────────────────────────────────────────────────── */
 static int detect_motion(size_t cur, size_t prev)
 {

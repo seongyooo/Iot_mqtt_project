@@ -2,7 +2,7 @@
  * publisher.c
  *
  * Build:
- * gcc -Wall -O2 -o publisher publisher.c -lmosquitto -lsqlite3 -lpthread
+ *   gcc -Wall -O2 -o publisher publisher.c -lmosquitto -lsqlite3 -lpthread
  */
 
 #include <stdio.h>
@@ -23,19 +23,18 @@
 #define TOPIC_EVENT   "camera/" CAM_ID "/event"
 #define TOPIC_STATUS  "camera/" CAM_ID "/status"
 
-/* ── 브로커 failover 목록 (블랙리스트 기능 추가) ────────────────*/
+/* ── 브로커 failover 목록 ────────────────────────────────────── */
 typedef struct {
     const char *host;
     int         port;
     const char *label;
-    time_t      dead_until;  /* 이 시간 이전에는 무조건 스킵 */
 } broker_t;
 
-static broker_t BROKERS[] = {
-    { "192.168.0.7",  1883, "B1", 0 },
-    { "192.168.0.11", 1883, "B2", 0 },
-    { "192.168.0.13", 1883, "B3", 0 },
-    { "192.168.0.9",  1883, "B4", 0 },
+static const broker_t BROKERS[] = {
+    { "192.168.0.7",  1883, "B1" },
+    { "192.168.0.11", 1883, "B2" },
+    { "192.168.0.13", 1883, "B3" },
+    { "192.168.0.9",  1883, "B4" },
 };
 #define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
 
@@ -61,7 +60,7 @@ static broker_t BROKERS[] = {
  * ───────────────────────────────────────────────────────────── */
 static int              g_broker_idx    = 0;
 static int              g_connected     = 0;
-static volatile int     g_need_failover = 1; /* 초기 시작 시 failover 타게 함 */
+static volatile int     g_need_failover = 0;
 static pthread_mutex_t  g_mutex         = PTHREAD_MUTEX_INITIALIZER;
 static struct mosquitto *g_mosq         = NULL;
 static sqlite3         *g_db            = NULL;
@@ -143,103 +142,90 @@ static void on_connect(struct mosquitto *mosq, void *ud, int rc)
     }
 }
 
+/*
+ * ⚠️  콜백은 libmosquitto 내부 네트워크 스레드에서 실행된다.
+ *     deadlock 방지를 위해 플래그만 세우고
+ *     실제 재연결은 메인 루프에서 처리한다.
+ */
 static void on_disconnect(struct mosquitto *mosq, void *ud, int rc)
 {
     (void)ud; (void)mosq;
     pthread_mutex_lock(&g_mutex);
     g_connected = 0;
     pthread_mutex_unlock(&g_mutex);
-    
     if (rc != 0) {
         printf("[MQTT] Disconnected from %s. Triggering failover...\n",
                BROKERS[g_broker_idx].label);
-        
-        /* 백그라운드 연결 실패 시 해당 브로커에 60초 페널티 부여 */
-        BROKERS[g_broker_idx].dead_until = time(NULL) + 60;
         g_need_failover = 1;
     }
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 무중단 Failover 처리 (객체 재성성 + 비동기 + 블랙리스트 + Keepalive 단축)
+ * failover — loop_stop → disconnect → connect → loop_start
  * ───────────────────────────────────────────────────────────── */
-static void do_failover(void)
+static void do_failover(struct mosquitto *mosq)
 {
-    pthread_mutex_lock(&g_mutex);
-    g_connected = 0;
-    pthread_mutex_unlock(&g_mutex);
+    g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
+    printf("[Failover] Switching to %s (%s)\n",
+           BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
 
-    /* 1. 꼬여있을 수 있는 기존 연결 객체 완전 파괴 */
-    if (g_mosq) {
-        mosquitto_loop_stop(g_mosq, true);
-        mosquitto_destroy(g_mosq);
+
+    mosquitto_disconnect(mosq);   /* network thread는 유지 — loop_stop 제거 */
+    int rc = mosquitto_connect_async(mosq,
+                                     BROKERS[g_broker_idx].host,
+                                     BROKERS[g_broker_idx].port, 10);
+
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[Failover] connect_async to %s rc=%d, will retry\n",
+                BROKERS[g_broker_idx].label, rc);
+        g_need_failover = 1;
+        return;
     }
+    g_need_failover = 0;
+    /* loop_start 재호출 안 함 — main에서 1회 시작해 계속 실행 중 */
+}
 
-    /* 2. 깨끗한 새 객체 생성 */
-    g_mosq = mosquitto_new("cctv_pub_" CAM_ID, false, NULL);
-    if (!g_mosq) { perror("mosquitto_new"); return; }
-    
-    mosquitto_connect_callback_set(g_mosq, on_connect);
-    mosquitto_disconnect_callback_set(g_mosq, on_disconnect);
-    mosquitto_reconnect_delay_set(g_mosq, 1, 5, false);
-    mosquitto_will_set(g_mosq, TOPIC_STATUS, strlen("offline"), "offline", 1, true);
+/* ─────────────────────────────────────────────────────────────
+ * MQTT 초기화
+ * ───────────────────────────────────────────────────────────── */
+static struct mosquitto *mqtt_init(void)
+{
+    mosquitto_lib_init();
+    struct mosquitto *mosq = mosquitto_new("cctv_pub_" CAM_ID, false, NULL);
+    if (!mosq) { perror("mosquitto_new"); return NULL; }
+    mosquitto_connect_callback_set(mosq, on_connect);
+    mosquitto_disconnect_callback_set(mosq, on_disconnect);
+    mosquitto_reconnect_delay_set(mosq, 1, 5, false);
+    mosquitto_will_set(mosq, TOPIC_STATUS, strlen("offline"), "offline", 1, true);
 
-    time_t now = time(NULL);
-    int connected = 0;
-
-    for (int i = 0; i < BROKER_COUNT; i++) {
-        g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
-        
-        /* 3. 블랙리스트 검사: 페널티 기간이면 즉시 스킵 (0초 소요) */
-        if (now < BROKERS[g_broker_idx].dead_until) {
-            printf("[Failover] Skipping %s (Dead until %ld)\n", 
-                   BROKERS[g_broker_idx].label, BROKERS[g_broker_idx].dead_until - now);
-            continue; 
-        }
-
-        printf("[Failover] Trying %s (%s)...\n", 
-               BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
-
-        /* 4. 비동기 연결 (Keepalive 5초로 단축하여 반좀비 상태 방지) */
-        int rc = mosquitto_connect_async(g_mosq, 
-                                         BROKERS[g_broker_idx].host, 
-                                         BROKERS[g_broker_idx].port, 5);
-                                         
-        if (rc == MOSQ_ERR_SUCCESS) {
-            connected = 1;
-            break; 
-        } else {
-            /* 문법/시스템 레벨 에러 발생 시 즉시 블랙리스트 추가 */
-            printf("[Failover] Failed to connect %s (rc=%d). Blacklisted for 60s.\n", 
-                   BROKERS[g_broker_idx].label, rc);
-            BROKERS[g_broker_idx].dead_until = now + 60;
-        }
-    }
-
-    if (connected) {
-        g_need_failover = 0;
-        mosquitto_loop_start(g_mosq);
+    g_broker_idx = 0;
+    int rc = mosquitto_connect_async(mosq,
+                                     BROKERS[0].host, BROKERS[0].port, 10);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[MQTT] Initial connect_async rc=%d, failover will retry\n", rc);
+        g_need_failover = 1;
     } else {
-        printf("[Failover] All brokers are dead or skipped. Sleeping...\n");
-        sleep(2);
-        g_need_failover = 1; /* 메인 루프에서 계속 재시도 유도 */
+        printf("[MQTT] Initial connect_async to %s (%s)\n",
+               BROKERS[0].host, BROKERS[0].label);
     }
+    mosquitto_loop_start(mosq);
+    return mosq;
 }
 
 /* ─────────────────────────────────────────────────────────────
  * 이벤트 발행 — QoS 2 + SQLite fallback
  * ───────────────────────────────────────────────────────────── */
-static void publish_event(const char *payload)
+static void publish_event(struct mosquitto *mosq, const char *payload)
 {
     db_enqueue(TOPIC_EVENT, payload);
     pthread_mutex_lock(&g_mutex);
     int connected = g_connected;
     pthread_mutex_unlock(&g_mutex);
-    if (connected && g_mosq) db_flush(g_mosq);
+    if (connected) db_flush(mosq);
 }
 
 /* ─────────────────────────────────────────────────────────────
- * rpicam-vid 파이프 & 카메라 처리
+ * rpicam-vid 파이프
  * ───────────────────────────────────────────────────────────── */
 static FILE *open_camera_pipe(void)
 {
@@ -254,6 +240,10 @@ static FILE *open_camera_pipe(void)
     return p;
 }
 
+/* ─────────────────────────────────────────────────────────────
+ * MJPEG 스트림 → JPEG 프레임 1개 파싱
+ *   SOI: 0xFF 0xD8 / EOI: 0xFF 0xD9
+ * ───────────────────────────────────────────────────────────── */
 static uint8_t *read_jpeg_frame(FILE *pipe, size_t *out_size)
 {
     static uint8_t buf[FRAME_MAX];
@@ -285,6 +275,13 @@ static uint8_t *read_jpeg_frame(FILE *pipe, size_t *out_size)
     }
 }
 
+/* ─────────────────────────────────────────────────────────────
+ * 모션 감지 — 연속 프레임 임계값 방식
+ *
+ * JPEG 크기 ∝ 화면 복잡도. 움직임 → 압축률 저하 → 크기 증가.
+ * MOTION_CONFIRM_FRAMES 연속으로 임계값 초과 시에만 모션으로 확정해
+ * 조명 변화 등 1프레임 노이즈에 의한 오감지를 방지한다.
+ * ───────────────────────────────────────────────────────────── */
 static int detect_motion(size_t cur, size_t prev)
 {
     static int consecutive_count = 0;
@@ -312,7 +309,8 @@ static int detect_motion(size_t cur, size_t prev)
 int main(void)
 {
     if (db_init() != 0) return -1;
-    mosquitto_lib_init(); /* 라이브러리 초기화 한 번 수행 */
+    g_mosq = mqtt_init();
+    if (!g_mosq) return -1;
 
     printf("[Publisher] CAM_ID=%s  %dx%d @%dfps\n",
            CAM_ID, CAM_WIDTH, CAM_HEIGHT, CAM_FPS);
@@ -327,8 +325,8 @@ retry:;
     printf("[Camera] Pipe opened\n");
 
     while (1) {
-        /* 파라미터 없이 호출 (함수 내부에서 전역 g_mosq 교체) */
-        if (g_need_failover) do_failover();
+        /* failover 처리 — 플래그 확인 후 do_failover() 호출 */
+        if (g_need_failover) do_failover(g_mosq);
 
         size_t   fsize = 0;
         uint8_t *frame = read_jpeg_frame(pipe, &fsize);
@@ -337,24 +335,27 @@ retry:;
             pclose(pipe); sleep(2); goto retry;
         }
 
+        /* 프레임 발행 — QoS 0, 순수 JPEG (헤더 없음) */
         pthread_mutex_lock(&g_mutex);
         int connected = g_connected;
         pthread_mutex_unlock(&g_mutex);
 
-        if (connected && g_mosq && !g_need_failover)
+        if (connected)
             mosquitto_publish(g_mosq, NULL, TOPIC_FRAME,
                               (int)fsize, frame, 0, false);
 
+        /* 모션 감지 → 이벤트 발행 QoS 2 */
         if (detect_motion(fsize, prev_size)) {
             char payload[128];
             snprintf(payload, sizeof(payload),
                      "{\"cam\":\"%s\",\"event\":\"motion\",\"ts\":%ld}",
                      CAM_ID, (long)time(NULL));
-            publish_event(payload);
+            publish_event(g_mosq, payload);
             printf("[Event] Motion detected  frame=%zu bytes\n", fsize);
         }
         prev_size = fsize;
 
+        /* FPS 출력 (10초마다) */
         frame_cnt++;
         time_t now = time(NULL);
         if (now - last_fps_t >= 10) {
@@ -367,10 +368,8 @@ retry:;
     }
 
     pclose(pipe);
-    if (g_mosq) {
-        mosquitto_loop_stop(g_mosq, true);
-        mosquitto_destroy(g_mosq);
-    }
+    mosquitto_loop_stop(g_mosq, true);
+    mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();
     sqlite3_close(g_db);
     return 0;

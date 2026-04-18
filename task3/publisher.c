@@ -69,6 +69,7 @@ static volatile int     g_need_failover  = 0;  /* on_disconnect → main 루프 
 static pthread_mutex_t  g_mutex          = PTHREAD_MUTEX_INITIALIZER;
 static struct mosquitto *g_mosq          = NULL;
 static sqlite3         *g_db             = NULL;
+static uint32_t         g_seq            = 0;  /* 프레임/이벤트 공용 시퀀스 (브리지 중복 dedup용) */
 
 /* ─────────────────────────────────────────────────────────────
  * SQLite 큐
@@ -441,16 +442,29 @@ retry:;
         int connected = g_connected;
         pthread_mutex_unlock(&g_mutex);
 
-        if (connected)
-            mosquitto_publish(g_mosq, NULL, TOPIC_FRAME,
-                              (int)fsize, frame, 0, false);
+        if (connected) {
+            /* 8B 헤더(seq 4B LE + cam tag 4B) prepend → sub에서 dedup 후 제거 */
+            uint8_t  header[8] = {0};
+            uint32_t s = ++g_seq;
+            memcpy(header, &s, 4);
+            memcpy(header + 4, CAM_ID, strnlen(CAM_ID, 4));
+
+            uint8_t *pkt = malloc(8 + fsize);
+            if (pkt) {
+                memcpy(pkt, header, 8);
+                memcpy(pkt + 8, frame, fsize);
+                mosquitto_publish(g_mosq, NULL, TOPIC_FRAME,
+                                  (int)(8 + fsize), pkt, 0, false);
+                free(pkt);
+            }
+        }
 
         /* ── 모션 감지 → 이벤트 발행 QoS 2 (무손실) ── */
         if (detect_motion(fsize, prev_size)) {
             char payload[128];
             snprintf(payload, sizeof(payload),
-                     "{\"cam\":\"%s\",\"event\":\"motion\",\"ts\":%ld}",
-                     CAM_ID, (long)time(NULL));
+                     "{\"cam\":\"%s\",\"event\":\"motion\",\"ts\":%ld,\"seq\":%u}",
+                     CAM_ID, (long)time(NULL), ++g_seq);
             publish_event(g_mosq, payload);
             printf("[Event] Motion detected  frame=%zu bytes\n", fsize);
         }

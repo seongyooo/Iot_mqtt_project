@@ -27,8 +27,8 @@
 /* ─────────────────────────────────────────────────────────────
  * dedup 자료구조 — 해시 테이블 기반 O(1)
  * ───────────────────────────────────────────────────────────── */
-#define DEDUP_SIZE  1024
-#define TTL_SECONDS 60
+#define DEDUP_SIZE  8192
+#define TTL_SECONDS 10
 #define ID_MAX_LEN  64
 
 typedef struct {
@@ -68,6 +68,13 @@ static int is_duplicate(const char *msg_id) {
 
 static void extract_msg_id(const char *cam_id, const char *payload,
                             char *out, size_t out_len) {
+    const char *seq_start = strstr(payload, "\"seq\":");
+    if (seq_start) {
+        seq_start += 6;
+        unsigned int seq = (unsigned int)strtoul(seq_start, NULL, 10);
+        snprintf(out, out_len, "%s-e%u", cam_id, seq);
+        return;
+    }
     const char *ts_start = strstr(payload, "\"ts\":");
     if (ts_start) {
         ts_start += 5;
@@ -214,26 +221,36 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
     /* ── frame 토픽 ─────────────────────────────────────────── */
     if (strstr(msg->topic, "/frame")) {
         /*
-         * 프레임 캐시 업데이트 후 브로드캐스트.
-         * dedup 미적용: QoS 0, 손실 허용, 중복 와도 화면 갱신만 됨.
-         * 캐시는 더 이상 onopen에서 사용하지 않지만 유지한다.
+         * 8B 헤더(seq 4B LE + cam tag 4B) 기반 dedup.
+         * 브로커 브리지 병렬 경로로 동일 seq가 2~3중 도달하는 것을 차단.
+         * 헤더 제거 후 순수 JPEG만 WS로 전달.
          */
+        if (msg->payloadlen < 8) return;
+
+        const uint8_t *buf = (const uint8_t *)msg->payload;
+        uint32_t seq;
+        memcpy(&seq, buf, 4);
+
+        char fid[ID_MAX_LEN];
+        snprintf(fid, sizeof(fid), "%s-f%u", cam_id, seq);
+        if (is_duplicate(fid)) return;
+
+        const char *jpeg     = (const char *)(buf + 8);
+        uint64_t    jpeg_len = (uint64_t)(msg->payloadlen - 8);
+
         pthread_mutex_lock(&g_mutex);
         FrameCache *c = get_cache(cam_id);
         if (c) {
             free(c->data);
-            c->data = malloc(msg->payloadlen);
+            c->data = malloc((size_t)jpeg_len);
             if (c->data) {
-                memcpy(c->data, msg->payload, msg->payloadlen);
-                c->size = (size_t)msg->payloadlen;
+                memcpy(c->data, jpeg, (size_t)jpeg_len);
+                c->size = (size_t)jpeg_len;
             }
         }
         pthread_mutex_unlock(&g_mutex);
 
-        ws_sendframe_bcast(WS_PORT,
-            (const char *)msg->payload,
-            (uint64_t)msg->payloadlen,
-            WS_FR_OP_BIN);
+        ws_sendframe_bcast(WS_PORT, jpeg, jpeg_len, WS_FR_OP_BIN);
         return;
     }
 

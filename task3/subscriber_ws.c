@@ -6,6 +6,9 @@
  *   2. failover 재연결 → loop_stop → disconnect → connect 방식 (민준이 방식)
  *   3. dedup → 해시 테이블 기반 O(1) 중복 제거
  *   4. mosquitto_loop_forever → 수동 루프로 교체 (플래그 체크 가능)
+ *   5. retain 메시지 무시 (offline 깜빡임 방지)
+ *   6. payload JSON 따옴표 처리 (online/offline 문자열)
+ *   7. onopen 캐시 전송 제거 (실시간성 보장)
  *
  * Build:
  *   gcc -Wall -O2 -o subscriber_ws subscriber_ws.c \
@@ -23,13 +26,6 @@
 
 /* ─────────────────────────────────────────────────────────────
  * dedup 자료구조 — 해시 테이블 기반 O(1)
- *
- * B3↔B4 양방향 브릿지 구조상 동일한 메시지가 두 경로로
- * Sub에 도달할 수 있다. message-id를 해시 테이블에 기록해
- * 중복 수신 시 버린다.
- *
- * 적용 대상: event / status 토픽 (QoS 1/2, 중복 처리 필요)
- * 미적용:    frame 토픽 (QoS 0, 손실 허용 + 중복 무방)
  * ───────────────────────────────────────────────────────────── */
 #define DEDUP_SIZE  1024
 #define TTL_SECONDS 60
@@ -70,11 +66,6 @@ static int is_duplicate(const char *msg_id) {
     return 0;
 }
 
-/*
- * event/status payload에서 dedup용 고유 id 생성
- * publisher 형식: {"cam":"pi1","event":"motion","ts":1713000000}
- * → "pi1-1713000000" 형태로 id 생성
- */
 static void extract_msg_id(const char *cam_id, const char *payload,
                             char *out, size_t out_len) {
     const char *ts_start = strstr(payload, "\"ts\":");
@@ -97,10 +88,10 @@ typedef struct {
 } broker_t;
 
 static const broker_t BROKERS[] = {
-    { "192.168.0.13", 1883, "B3" },  /* Primary 출구 브로커 */
-    { "192.168.0.9",  1883, "B4" },  /* Backup 출구 브로커  */
-    { "192.168.0.7",  1883, "B1" },  // 추가
-    { "192.168.0.11", 1883, "B2" },  // 추가
+    { "192.168.0.13", 1883, "B3" },
+    { "192.168.0.9",  1883, "B4" },
+    { "192.168.0.7",  1883, "B1" },
+    { "192.168.0.11", 1883, "B2" },
 };
 #define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
 
@@ -109,7 +100,7 @@ static const broker_t BROKERS[] = {
 #define TOPIC_EVENT   "camera/+/event"
 #define TOPIC_STATUS  "camera/+/status"
 
-/* ── 최신 프레임 캐시 (카메라별) ────────────────────────────── */
+/* ── 전역 상태 ───────────────────────────────────────────────── */
 #define MAX_CAMS 4
 typedef struct {
     char     cam_id[16];
@@ -122,7 +113,7 @@ static int              g_frame_count    = 0;
 static pthread_mutex_t  g_mutex          = PTHREAD_MUTEX_INITIALIZER;
 static int              g_broker_idx     = 0;
 static int              g_connected      = 0;
-static volatile int     g_need_failover  = 0;  /* on_disconnect → main 루프 통신용 플래그 */
+static volatile int     g_need_failover  = 0;
 static struct mosquitto *g_mosq          = NULL;
 
 static FrameCache *get_cache(const char *cam_id) {
@@ -153,14 +144,11 @@ static void extract_cam_id(const char *topic, char *out, size_t out_len) {
  * ───────────────────────────────────────────────────────────── */
 void onopen(ws_cli_conn_t client) {
     printf("[WS] Connected: %s\n", ws_getaddress(client));
-    pthread_mutex_lock(&g_mutex);
-    for (int i = 0; i < g_frame_count; i++) {
-        if (g_frames[i].data && g_frames[i].size > 0)
-            ws_sendframe_bin(client,
-                (const char *)g_frames[i].data,
-                g_frames[i].size);
-    }
-    pthread_mutex_unlock(&g_mutex);
+    /*
+     * 캐시 프레임 즉시 전송 제거.
+     * 오래된 프레임을 보내면 실시간성이 깨진다.
+     * 브라우저는 다음 MQTT 프레임이 도착하는 즉시 화면을 갱신한다.
+     */
 }
 
 void onclose(ws_cli_conn_t client) {
@@ -175,10 +163,6 @@ void onmessage(ws_cli_conn_t client,
 /* ─────────────────────────────────────────────────────────────
  * MQTT 콜백
  * ───────────────────────────────────────────────────────────── */
-
-/* 브로커 연결 성공 시 — 세 토픽 모두 재구독
- * 재연결 시에도 호출되므로 구독을 여기서 등록하면
- * 최초 연결 / failover 재연결 모두 보장된다. */
 static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
     (void)ud;
     if (rc != 0) {
@@ -198,13 +182,6 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
     mosquitto_subscribe(mosq, NULL, TOPIC_STATUS, 1);
 }
 
-/*
- * 브로커 연결 끊김 시 호출
- *
- * ⚠️  콜백은 libmosquitto 내부 네트워크 스레드에서 실행된다.
- *     여기서 mosquitto_connect()를 직접 호출하면 deadlock 위험.
- *     플래그만 세우고 실제 재연결은 메인 루프에서 처리한다.
- */
 static void on_mqtt_disconnect(struct mosquitto *mosq, void *ud, int rc) {
     (void)ud;
     (void)mosq;
@@ -219,18 +196,28 @@ static void on_mqtt_disconnect(struct mosquitto *mosq, void *ud, int rc) {
     }
 }
 
-/* 메시지 수신 시 처리 */
 static void on_mqtt_message(struct mosquitto *mosq, void *ud,
                              const struct mosquitto_message *msg) {
     (void)mosq; (void)ud;
     if (!msg->payload || msg->payloadlen <= 0) return;
 
+    /*
+     * retain 메시지 무시
+     * LWT "offline"이 retain으로 설정되어 구독 시 즉시 전달된다.
+     * 이를 처리하면 브라우저 화면이 계속 깜빡이므로 무시한다.
+     */
+    if (msg->retain) return;
+
     char cam_id[16];
     extract_cam_id(msg->topic, cam_id, sizeof(cam_id));
 
-    /* ── frame 토픽: dedup 없이 binary broadcast ─────────────
-     * QoS 0, 손실 허용. 중복 수신돼도 화면 갱신만 되므로 무방. */
+    /* ── frame 토픽 ─────────────────────────────────────────── */
     if (strstr(msg->topic, "/frame")) {
+        /*
+         * 프레임 캐시 업데이트 후 브로드캐스트.
+         * dedup 미적용: QoS 0, 손실 허용, 중복 와도 화면 갱신만 됨.
+         * 캐시는 더 이상 onopen에서 사용하지 않지만 유지한다.
+         */
         pthread_mutex_lock(&g_mutex);
         FrameCache *c = get_cache(cam_id);
         if (c) {
@@ -242,6 +229,7 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
             }
         }
         pthread_mutex_unlock(&g_mutex);
+
         ws_sendframe_bcast(WS_PORT,
             (const char *)msg->payload,
             (uint64_t)msg->payloadlen,
@@ -249,9 +237,7 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
         return;
     }
 
-    /* ── event / status 토픽: dedup 적용 후 text broadcast ───
-     * B3↔B4 양방향 브릿지로 인해 동일 메시지가 두 경로로 도달 가능.
-     * cam_id + ts 조합으로 id를 만들어 중복 차단. */
+    /* ── event / status 토픽: dedup 적용 ───────────────────── */
     char msg_id[ID_MAX_LEN];
     extract_msg_id(cam_id, (const char *)msg->payload,
                    msg_id, sizeof(msg_id));
@@ -262,12 +248,23 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
     }
     printf("[DEDUP] ACCEPT topic=%s id=%s\n", msg->topic, msg_id);
 
+    /*
+     * payload가 순수 문자열("online", "offline")이면 따옴표 추가.
+     * JSON 객체({)가 아니면 브라우저에서 JSON.parse 실패.
+     */
     char wrapper[1024];
-    const char *type = strstr(msg->topic, "/event") ? "event" : "status";
-    snprintf(wrapper, sizeof(wrapper),
-             "{\"type\":\"%s\",\"cam\":\"%s\",\"data\":%.*s}",
-             type, cam_id,
-             msg->payloadlen, (char *)msg->payload);
+    const char *type        = strstr(msg->topic, "/event") ? "event" : "status";
+    const char *payload_str = (const char *)msg->payload;
+
+    if (payload_str[0] == '{' || payload_str[0] == '[') {
+        snprintf(wrapper, sizeof(wrapper),
+                 "{\"type\":\"%s\",\"cam\":\"%s\",\"data\":%.*s}",
+                 type, cam_id, msg->payloadlen, payload_str);
+    } else {
+        snprintf(wrapper, sizeof(wrapper),
+                 "{\"type\":\"%s\",\"cam\":\"%s\",\"data\":\"%.*s\"}",
+                 type, cam_id, msg->payloadlen, payload_str);
+    }
 
     ws_sendframe_bcast(WS_PORT,
         wrapper, (uint64_t)strlen(wrapper),
@@ -278,9 +275,6 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
 
 /* ─────────────────────────────────────────────────────────────
  * failover 실행
- *
- * 민준이 방식: loop_stop → disconnect → 인덱스 이동 → connect → loop_start
- * 내부 상태를 완전히 정리한 뒤 새 브로커로 재연결한다.
  * ───────────────────────────────────────────────────────────── */
 static void do_failover(struct mosquitto *mosq)
 {
@@ -312,7 +306,6 @@ static void do_failover(struct mosquitto *mosq)
  * main
  * ───────────────────────────────────────────────────────────── */
 int main(void) {
-    /* 1. WebSocket 서버 (백그라운드 스레드) */
     ws_socket(&(struct ws_server){
         .host          = "0.0.0.0",
         .port          = WS_PORT,
@@ -324,7 +317,6 @@ int main(void) {
     });
     printf("[WS] Server started on port %d\n", WS_PORT);
 
-    /* 2. MQTT 초기화 */
     mosquitto_lib_init();
     g_mosq = mosquitto_new("cctv_sub_edge_c", false, NULL);
     if (!g_mosq) { perror("mosquitto_new"); return -1; }
@@ -332,8 +324,6 @@ int main(void) {
     mosquitto_connect_callback_set(g_mosq, on_mqtt_connect);
     mosquitto_disconnect_callback_set(g_mosq, on_mqtt_disconnect);
     mosquitto_message_callback_set(g_mosq, on_mqtt_message);
-
-    /* reconnect delay 설정 (민준이 방식) */
     mosquitto_reconnect_delay_set(g_mosq, 1, 5, false);
 
     if (mosquitto_connect(g_mosq,
@@ -346,19 +336,13 @@ int main(void) {
 
     mosquitto_loop_start(g_mosq);
 
-    /*
-     * 3. 수동 메인 루프
-     * loop_forever 대신 usleep(100ms) 루프를 사용해
-     * g_need_failover 플래그를 주기적으로 확인한다.
-     */
     while (1) {
         if (g_need_failover) {
             do_failover(g_mosq);
         }
-        usleep(100 * 1000);  /* 100ms */
+        usleep(100 * 1000);
     }
 
-    /* 정상 종료 시 cleanup */
     mosquitto_loop_stop(g_mosq, true);
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();

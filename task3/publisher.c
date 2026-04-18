@@ -172,7 +172,7 @@ static void do_failover(struct mosquitto *mosq)
     mosquitto_disconnect(mosq);
     int rc = mosquitto_connect(mosq,
                                BROKERS[g_broker_idx].host,
-                               BROKERS[g_broker_idx].port, 60);
+                               BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
         fprintf(stderr, "[Failover] Connect failed to %s, will retry\n",
                 BROKERS[g_broker_idx].label);
@@ -198,7 +198,7 @@ static struct mosquitto *mqtt_init(void)
     mosquitto_reconnect_delay_set(mosq, 1, 5, false);
     mosquitto_will_set(mosq, TOPIC_STATUS, strlen("offline"), "offline", 1, true);
     for (int i = 0; i < BROKER_COUNT; i++) {
-        if (mosquitto_connect(mosq, BROKERS[i].host, BROKERS[i].port, 60)
+        if (mosquitto_connect(mosq, BROKERS[i].host, BROKERS[i].port, 10)
                 == MOSQ_ERR_SUCCESS) {
             g_broker_idx = i;
             printf("[MQTT] Initial connect to %s (%s)\n",

@@ -39,7 +39,6 @@ static const broker_t BROKERS[] = {
 #define TOPIC_STATUS  "camera/+/status"
 
 /* ── 전역 상태 ───────────────────────────────────────────────── */
-static pthread_mutex_t  g_mutex         = PTHREAD_MUTEX_INITIALIZER;
 static int              g_broker_idx    = 0;
 static int              g_connected     = 0;
 static volatile int     g_need_failover = 0;
@@ -76,7 +75,7 @@ void onmessage(ws_cli_conn_t client,
 }
 
 /* ─────────────────────────────────────────────────────────────
- * MQTT 콜백
+ * MQTT 콜백 — 모두 메인 스레드(mosquitto_loop) 컨텍스트에서 호출됨
  * ───────────────────────────────────────────────────────────── */
 static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
     (void)ud;
@@ -86,12 +85,12 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
         return;
     }
     g_need_failover = 0;
-    pthread_mutex_lock(&g_mutex);
-    g_connected = 1;
-    pthread_mutex_unlock(&g_mutex);
+    g_connected     = 1;
     g_connect_start = 0;
     printf("[MQTT] Connected to %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
+    /* 비스레드 모드: mosquitto_loop() 안에서 호출되므로
+     * mosquitto_subscribe 호출이 안전하다. */
     mosquitto_subscribe(mosq, NULL, TOPIC_FRAME,  0);
     mosquitto_subscribe(mosq, NULL, TOPIC_EVENT,  2);
     mosquitto_subscribe(mosq, NULL, TOPIC_STATUS, 1);
@@ -99,9 +98,7 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
 
 static void on_mqtt_disconnect(struct mosquitto *mosq, void *ud, int rc) {
     (void)ud; (void)mosq;
-    pthread_mutex_lock(&g_mutex);
     g_connected = 0;
-    pthread_mutex_unlock(&g_mutex);
     if (rc != 0) {
         printf("[MQTT] Disconnected from %s. Triggering failover...\n",
                BROKERS[g_broker_idx].label);
@@ -155,36 +152,22 @@ static void setup_callbacks(struct mosquitto *mosq) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * mosq_stop — 네트워크 스레드 강제 종료
- *
- * mosquitto_disconnect()는 connect_pending 상태(TCP SYN 대기)일 때
- * 소켓을 닫지 않고 MOSQ_ERR_NO_CONN을 반환한다.
- * loop_stop(false)만 쓰면 select()가 블로킹되어 수십 초 대기한다.
- *
- * loop_stop(true): pthread_cancel로 스레드 강제 종료 후 pthread_join.
- * 취소된 스레드가 보유한 mutex는 per-instance이므로,
- * 바로 뒤에 mosquitto_destroy로 인스턴스를 소멸시키면 안전하다.
- *
- * shutdown(sock)을 쓰지 않는 이유:
- * shutdown이 소켓을 강제 닫으면 mosquitto 내부에서 close(fd)를 중복
- * 호출하거나, 새 소켓이 같은 fd 번호를 재사용해 connect_async에서
- * MOSQ_ERR_ERRNO(rc=14) 오류가 발생할 수 있다.
- * ───────────────────────────────────────────────────────────── */
-static void mosq_stop(struct mosquitto *mosq) {
-    mosquitto_disconnect(mosq);      /* MQTT DISCONNECT 시도 (connect_pending이면 no-op) */
-    mosquitto_loop_stop(mosq, true); /* pthread_cancel + pthread_join — 즉시 종료 보장 */
-}
-
-/* ─────────────────────────────────────────────────────────────
  * failover — 인스턴스 destroy → 재생성 → connect_async
+ *
+ * loop_start/loop_stop을 사용하지 않는다.
+ * mosquitto 네트워크 루프는 메인 루프에서 mosquitto_loop()로 직접
+ * 구동하므로, pthread_cancel에 의한 글로벌 상태 오염이 없다.
+ *
+ * connect_pending(TCP SYN 대기) 상태에서도 단순히 destroy하면 되고
+ * 스레드 종료를 기다릴 필요가 없다.
  * ───────────────────────────────────────────────────────────── */
 static void do_failover(void) {
     g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
     printf("[Failover] Switching to %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
 
-    mosq_stop(g_mosq);
-    mosquitto_destroy(g_mosq);
+    mosquitto_disconnect(g_mosq);
+    mosquitto_destroy(g_mosq);   /* 스레드 없음 → 단순 소멸 */
 
     g_mosq = mosquitto_new("cctv_sub_edge_c", true, NULL);
     if (!g_mosq) {
@@ -195,6 +178,7 @@ static void do_failover(void) {
     setup_callbacks(g_mosq);
 
     g_need_failover = 0;
+    g_connected     = 0;
     g_connect_start = time(NULL);
 
     int rc = mosquitto_connect_async(g_mosq,
@@ -205,15 +189,15 @@ static void do_failover(void) {
                 BROKERS[g_broker_idx].label, rc, mosquitto_strerror(rc));
         g_connect_start = 0;
         g_need_failover = 1;
-        return;
     }
-    mosquitto_loop_start(g_mosq);
+    /* loop_start 호출 없음 — 메인 루프의 mosquitto_loop()가 구동한다 */
 }
 
 /* ─────────────────────────────────────────────────────────────
  * main
  * ───────────────────────────────────────────────────────────── */
 int main(void) {
+    /* WebSocket 서버 — 별도 스레드 */
     ws_socket(&(struct ws_server){
         .host          = "0.0.0.0",
         .port          = WS_PORT,
@@ -243,23 +227,41 @@ int main(void) {
                BROKERS[0].host, BROKERS[0].label);
         g_connect_start = time(NULL);
     }
-    mosquitto_loop_start(g_mosq);
+    /* loop_start 없음 — 아래 메인 루프에서 mosquitto_loop()로 직접 구동 */
 
     while (1) {
-        if (g_need_failover) do_failover();
+        /* failover 처리 */
+        if (g_need_failover) {
+            do_failover();
+            continue; /* 새 인스턴스로 즉시 loop 재진입 */
+        }
 
+        /* TCP 연결 타임아웃 감지 */
         if (!g_connected && g_connect_start > 0 &&
             time(NULL) - g_connect_start > CONNECT_TIMEOUT_SEC) {
             printf("[Failover] TCP timeout on %s, switching next broker\n",
                    BROKERS[g_broker_idx].label);
             g_connect_start = 0;
             g_need_failover = 1;
+            continue;
         }
 
-        usleep(100 * 1000);
+        /*
+         * mosquitto 네트워크 루프를 메인 스레드에서 직접 구동.
+         * timeout_ms=100: 100ms마다 failover 플래그를 확인할 수 있다.
+         * loop_start/pthread_cancel 없음 → 글로벌 상태 오염 위험 없음.
+         */
+        rc = mosquitto_loop(g_mosq, 100, 1);
+        if (rc != MOSQ_ERR_SUCCESS && rc != MOSQ_ERR_NO_CONN) {
+            if (!g_need_failover) {
+                printf("[MQTT] Loop error rc=%d (%s), triggering failover\n",
+                       rc, mosquitto_strerror(rc));
+                g_need_failover = 1;
+            }
+        }
     }
 
-    mosq_stop(g_mosq);
+    mosquitto_disconnect(g_mosq);
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();
     return 0;

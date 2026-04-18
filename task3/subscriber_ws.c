@@ -178,8 +178,8 @@ static void do_failover(struct mosquitto *mosq) {
         g_need_failover = 1;
         return;
     }
+    g_need_failover = 0;          /* loop_start 전에 클리어 — race condition 방지 */
     mosquitto_loop_start(mosq);
-    g_need_failover = 0;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -210,8 +210,14 @@ int main(void) {
     if (mosquitto_connect(g_mosq,
                           BROKERS[g_broker_idx].host,
                           BROKERS[g_broker_idx].port, 60) != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[MQTT] Initial connect failed\n");
-        return -1;
+        /*
+         * 초기 연결 실패해도 종료하지 않는다.
+         * g_broker_idx를 BROKER_COUNT-1로 세팅해두면
+         * do_failover 첫 호출 시 0번(B3)부터 재시도한다.
+         */
+        fprintf(stderr, "[MQTT] Initial connect failed, will retry...\n");
+        g_broker_idx = BROKER_COUNT - 1;
+        g_need_failover = 1;
     }
     mosquitto_loop_start(g_mosq);
 

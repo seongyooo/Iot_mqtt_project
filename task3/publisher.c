@@ -180,8 +180,9 @@ static void do_failover(struct mosquitto *mosq)
         g_need_failover = 1;
         return;
     }
+    g_need_failover = 0;          /* loop_start 전에 클리어 — race condition 방지 */
     mosquitto_loop_start(mosq);
-    g_need_failover = 0;
+    /* 브로커가 죽어있으면 on_disconnect가 다시 1로 세워 다음 failover 진입 */
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -310,6 +311,9 @@ int main(void)
     if (db_init() != 0) return -1;
     g_mosq = mqtt_init();
     if (!g_mosq) return -1;
+
+    /* 초기 연결 실패 시 즉시 failover 루프 진입 */
+    if (!g_connected) g_need_failover = 1;
 
     printf("[Publisher] CAM_ID=%s  %dx%d @%dfps\n",
            CAM_ID, CAM_WIDTH, CAM_HEIGHT, CAM_FPS);

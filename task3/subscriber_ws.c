@@ -211,9 +211,10 @@ int main(void) {
                           BROKERS[g_broker_idx].host,
                           BROKERS[g_broker_idx].port, 60) != MOSQ_ERR_SUCCESS) {
         /*
-         * 초기 연결 실패해도 종료하지 않는다.
-         * g_broker_idx를 BROKER_COUNT-1로 세팅해두면
-         * do_failover 첫 호출 시 0번(B3)부터 재시도한다.
+         * 초기 연결 실패 시 종료하지 않고 failover 루프로 진입.
+         * mosquitto_connect가 동기적으로 실패한 경우에만 여기 도달하므로
+         * g_need_failover = 1을 세워도 안전하다.
+         * (비동기 성공 후 on_connect 전에 체크하는 타이밍 버그 없음)
          */
         fprintf(stderr, "[MQTT] Initial connect failed, will retry...\n");
         g_broker_idx = BROKER_COUNT - 1;

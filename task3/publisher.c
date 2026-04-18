@@ -312,9 +312,6 @@ int main(void)
     g_mosq = mqtt_init();
     if (!g_mosq) return -1;
 
-    /* 초기 연결 실패 시 즉시 failover 루프 진입 */
-    if (!g_connected) g_need_failover = 1;
-
     printf("[Publisher] CAM_ID=%s  %dx%d @%dfps\n",
            CAM_ID, CAM_WIDTH, CAM_HEIGHT, CAM_FPS);
 

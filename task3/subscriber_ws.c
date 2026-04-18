@@ -166,45 +166,46 @@ static void do_failover(struct mosquitto *mosq) {
     g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
     printf("[Failover] Switching to %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
+    mosquitto_loop_stop(mosq, true);
+    mosquitto_disconnect(mosq);
+    int rc = mosquitto_connect(mosq,
+                               BROKERS[g_broker_idx].host,
+                               BROKERS[g_broker_idx].port, 60);
     mosquitto_disconnect(mosq);   /* network thread는 유지 — loop_stop 제거 */
     int rc = mosquitto_connect_async(mosq,
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[Failover] Connect failed to %s, will retry\n",
+                BROKERS[g_broker_idx].label);
+        sleep(1);
         fprintf(stderr, "[Failover] connect_async to %s rc=%d, will retry\n",
                 BROKERS[g_broker_idx].label, rc);
         g_need_failover = 1;
         return;
     }
+    g_need_failover = 0;          /* loop_start 전에 클리어 — race condition 방지 */
+    mosquitto_loop_start(mosq);
     g_need_failover = 0;
     /* loop_start 재호출 안 함 — main에서 1회 시작해 계속 실행 중 */
 }
 
 /* ─────────────────────────────────────────────────────────────
- * main
- * ───────────────────────────────────────────────────────────── */
-int main(void) {
-    /* WebSocket 서버 — 백그라운드 스레드 */
-    ws_socket(&(struct ws_server){
-        .host          = "0.0.0.0",
-        .port          = WS_PORT,
-        .thread_loop   = 1,
-        .timeout_ms    = 1000,
-        .evs.onopen    = &onopen,
-        .evs.onclose   = &onclose,
-        .evs.onmessage = &onmessage,
-    });
-    printf("[WS] Server started on port %d\n", WS_PORT);
-
-    mosquitto_lib_init();
-    g_mosq = mosquitto_new("cctv_sub_edge_c", false, NULL);
-    if (!g_mosq) { perror("mosquitto_new"); return -1; }
-
-    mosquitto_connect_callback_set(g_mosq, on_mqtt_connect);
-    mosquitto_disconnect_callback_set(g_mosq, on_mqtt_disconnect);
+@@ -207,31 +205,26 @@
     mosquitto_message_callback_set(g_mosq, on_mqtt_message);
     mosquitto_reconnect_delay_set(g_mosq, 1, 5, false);
 
+    if (mosquitto_connect(g_mosq,
+                          BROKERS[g_broker_idx].host,
+                          BROKERS[g_broker_idx].port, 60) != MOSQ_ERR_SUCCESS) {
+        /*
+         * 초기 연결 실패 시 종료하지 않고 failover 루프로 진입.
+         * mosquitto_connect가 동기적으로 실패한 경우에만 여기 도달하므로
+         * g_need_failover = 1을 세워도 안전하다.
+         * (비동기 성공 후 on_connect 전에 체크하는 타이밍 버그 없음)
+         */
+        fprintf(stderr, "[MQTT] Initial connect failed, will retry...\n");
+        g_broker_idx = BROKER_COUNT - 1;
     int rc = mosquitto_connect_async(g_mosq,
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
@@ -228,4 +229,3 @@ int main(void) {
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();
     return 0;
-}

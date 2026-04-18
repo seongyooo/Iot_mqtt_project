@@ -116,6 +116,11 @@ const brokerBadge = document.getElementById('broker-badge');
  *
  * 이 방식으로 프레임이 큐에 쌓여 오래된 것이 나오는 문제를 방지한다.
  * ───────────────────────────────────────────────────────────── */
+/* 목표 FPS — publisher의 CAM_FPS와 맞춤 */
+const TARGET_FPS   = 15;
+const FRAME_MS     = 1000 / TARGET_FPS;  /* 프레임 간격 약 66ms */
+let lastRenderTime = 0;
+
 let pendingFrame = null;
 let rendering    = false;
 
@@ -175,6 +180,19 @@ async function renderFrame(arrayBuffer) {
 }
 
 function onFrame(arrayBuffer) {
+  const now = performance.now();
+
+  /*
+   * FPS 제한 — TARGET_FPS 이상으로 빠르게 오는 프레임은 버린다.
+   * Publisher가 15fps로 보내도 WebSocket 버퍼에 쌓였다가
+   * 한꺼번에 처리되면 빨리감기처럼 보이는 문제를 방지한다.
+   */
+  if (now - lastRenderTime < FRAME_MS) {
+    pendingFrame = arrayBuffer;  /* 최신 프레임으로 교체만 해두고 버림 */
+    return;
+  }
+  lastRenderTime = now;
+
   if (!rendering) {
     rendering = true;
     renderFrame(arrayBuffer);

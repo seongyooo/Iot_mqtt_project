@@ -168,21 +168,18 @@ static void do_failover(struct mosquitto *mosq)
     g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
     printf("[Failover] Switching to %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
-    mosquitto_loop_stop(mosq, true);
-    mosquitto_disconnect(mosq);
-    int rc = mosquitto_connect(mosq,
-                               BROKERS[g_broker_idx].host,
-                               BROKERS[g_broker_idx].port, 60);
+    mosquitto_disconnect(mosq);   /* network thread는 유지 — loop_stop 제거 */
+    int rc = mosquitto_connect_async(mosq,
+                                     BROKERS[g_broker_idx].host,
+                                     BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[Failover] Connect failed to %s, will retry\n",
-                BROKERS[g_broker_idx].label);
-        sleep(1);
+        fprintf(stderr, "[Failover] connect_async to %s rc=%d, will retry\n",
+                BROKERS[g_broker_idx].label, rc);
         g_need_failover = 1;
         return;
     }
-    g_need_failover = 0;          /* loop_start 전에 클리어 — race condition 방지 */
-    mosquitto_loop_start(mosq);
-    /* 브로커가 죽어있으면 on_disconnect가 다시 1로 세워 다음 failover 진입 */
+    g_need_failover = 0;
+    /* loop_start 재호출 안 함 — main에서 1회 시작해 계속 실행 중 */
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -197,16 +194,15 @@ static struct mosquitto *mqtt_init(void)
     mosquitto_disconnect_callback_set(mosq, on_disconnect);
     mosquitto_reconnect_delay_set(mosq, 1, 5, false);
     mosquitto_will_set(mosq, TOPIC_STATUS, strlen("offline"), "offline", 1, true);
-    for (int i = 0; i < BROKER_COUNT; i++) {
-        if (mosquitto_connect(mosq, BROKERS[i].host, BROKERS[i].port, 60)
-                == MOSQ_ERR_SUCCESS) {
-            g_broker_idx = i;
-            printf("[MQTT] Initial connect to %s (%s)\n",
-                   BROKERS[i].host, BROKERS[i].label);
-            break;
-        }
-        fprintf(stderr, "[MQTT] %s (%s) unreachable\n",
-                BROKERS[i].host, BROKERS[i].label);
+    g_broker_idx = 0;
+    int rc = mosquitto_connect_async(mosq,
+                                     BROKERS[0].host, BROKERS[0].port, 10);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        fprintf(stderr, "[MQTT] Initial connect_async rc=%d, failover will retry\n", rc);
+        g_need_failover = 1;
+    } else {
+        printf("[MQTT] Initial connect_async to %s (%s)\n",
+               BROKERS[0].host, BROKERS[0].label);
     }
     mosquitto_loop_start(mosq);
     return mosq;

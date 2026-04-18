@@ -86,6 +86,7 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc) {
         fprintf(stderr, "[MQTT] Connect failed rc=%d\n", rc);
         return;
     }
+    g_failover_in_progress = 0;  /* 실제 연결 성공 시점에 해제 — stale on_disconnect 억제 종료 */
     pthread_mutex_lock(&g_mutex);
     g_connected = 1;
     pthread_mutex_unlock(&g_mutex);
@@ -204,8 +205,10 @@ static void do_failover(struct mosquitto *mosq) {
         g_connect_start = 0;
         g_need_failover = 1;
     }
-    g_failover_in_progress = 0;   /* 플래그 해제 — 이후 on_disconnect는 정상 처리 */
     /* loop_start 재호출 없음 — main에서 1회 시작해 계속 실행 중 */
+    /* g_failover_in_progress는 on_mqtt_connect에서 해제 —
+     * 여기서 해제하면 stale on_disconnect가 플래그 해제 후 도착해
+     * g_need_failover를 다시 세울 수 있음 (race condition) */
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -231,7 +234,8 @@ int main(void) {
     mosquitto_connect_callback_set(g_mosq, on_mqtt_connect);
     mosquitto_disconnect_callback_set(g_mosq, on_mqtt_disconnect);
     mosquitto_message_callback_set(g_mosq, on_mqtt_message);
-    mosquitto_reconnect_delay_set(g_mosq, 1, 5, false);
+    /* mosquitto_reconnect_delay_set 제거 — loop_start 모드에서 자동 재연결이
+     * 수동 failover와 타이밍 충돌 가능. 재연결은 TCP timeout 루프로만 관리. */
 
     /*
      * connect_async: 비동기 연결 — 브로커가 꺼져있어도 즉시 리턴.

@@ -187,8 +187,52 @@ void onclose(ws_cli_conn_t client) {
 }
 
 void onmessage(ws_cli_conn_t client,
-               const unsigned char *msg, uint64_t size, int type) {
-    (void)client; (void)msg; (void)size; (void)type;
+               const unsigned char *msg, uint64_t size, int type)
+{
+    (void)size; (void)type;
+    if (!msg) return;
+
+    /* 브라우저가 WS 연결 후 현재 상태 요청 */
+    if (strncmp((const char *)msg, "request_state", 13) == 0) {
+
+        /* 현재 cam 라우팅 상태 전송 */
+        pthread_mutex_lock(&g_cam_mutex);
+        for (int i = 0; i < g_cam_count; i++) {
+            if (!g_cam_status[i].last_from[0]) continue;
+            char json[256];
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"route\",\"cam\":\"%s\","
+                     "\"from\":\"%s\",\"via\":\"%s\"}",
+                     g_cam_status[i].cam_id,
+                     g_cam_status[i].last_from,
+                     g_cam_status[i].last_via);
+            ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
+        }
+        pthread_mutex_unlock(&g_cam_mutex);
+
+        /* 현재 브로커 활성 상태 전송 */
+        const char *names[] = {"b1","b2","b3","b4"};
+        pthread_mutex_lock(&g_broker_mutex);
+        time_t now = time(NULL);
+        for (int i = 0; i < 4; i++) {
+            if (g_broker_seen[i] == 0) continue;
+            int active = (now - g_broker_seen[i]) < BROKER_TIMEOUT_SEC;
+            char json[128];
+            snprintf(json, sizeof(json),
+                     "{\"type\":\"broker_status\","
+                     "\"broker\":\"%s\",\"active\":%s}",
+                     names[i], active ? "true" : "false");
+            ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
+        }
+        pthread_mutex_unlock(&g_broker_mutex);
+
+        /* Sub 연결 브로커 전송 */
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"type\":\"sub_connected\",\"broker\":\"%s\"}",
+                 BROKERS[g_broker_idx].label);
+        ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
+    }
 }
 
 /* ─────────────────────────────────────────

@@ -47,8 +47,8 @@ typedef struct {
 static const broker_t BROKERS[] = {
     { "192.168.0.29", 1883, "B3" },
     { "192.168.0.8",  1883, "B4" },
-    { "192.168.0.7",  1883, "B1" },
-    { "192.168.0.11", 1883, "B2" },
+    // { "192.168.0.7",  1883, "B1" },
+    // { "192.168.0.11", 1883, "B2" },
 };
 #define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
 
@@ -147,14 +147,25 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
     char cam_id[16];
     extract_cam_id(msg->topic, cam_id, sizeof(cam_id));
 
-    /* 프레임: 바이너리 브로드캐스트 */
-    if (strstr(msg->topic, "/frame")) {
-        ws_sendframe_bcast(WS_PORT,
-            (const char *)msg->payload,
-            (uint64_t)msg->payloadlen,
-            WS_FR_OP_BIN);
-        return;
-    }
+    /* 프레임: cam_id 헤더 + 바이너리 브로드캐스트 */
+if (strstr(msg->topic, "/frame")) {
+    /*
+     * 프로토콜: [1바이트: cam_id 길이][cam_id 문자열][JPEG 데이터]
+     * 프론트엔드가 cam_id를 파싱해 카메라별 캔버스로 라우팅한다.
+     */
+    uint8_t  id_len = (uint8_t)strlen(cam_id);
+    size_t   total  = 1 + id_len + (size_t)msg->payloadlen;
+    uint8_t *buf    = malloc(total);
+    if (!buf) return;
+
+    buf[0] = id_len;
+    memcpy(buf + 1,          cam_id,        id_len);
+    memcpy(buf + 1 + id_len, msg->payload,  msg->payloadlen);
+
+    ws_sendframe_bcast(WS_PORT, (const char *)buf, (uint64_t)total, WS_FR_OP_BIN);
+    free(buf);
+    return;
+}
 
     /* 이벤트 / 상태: JSON 래퍼 후 텍스트 브로드캐스트 */
     char wrapper[1024];

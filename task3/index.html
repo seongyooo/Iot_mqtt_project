@@ -25,19 +25,59 @@
     .badge.live { background: #0a2a0a; color: #4caf50; }
     .badge.err  { background: #2a0a0a; color: #f44336; }
     #ws-badge { margin-left: auto; }
+
     .main {
       display: flex; flex: 1; overflow: hidden;
       gap: 1px; background: #222;
     }
-    .video-wrap {
+
+    /* ── 카메라 그리드 ── */
+    #cam-grid {
+      flex: 1; display: grid;
+      gap: 2px; background: #222;
+      overflow: hidden;
+    }
+    /* 카메라 수에 따라 grid-template 동적 변경 (JS에서 처리) */
+
+    .cam-cell {
+      background: #111;
+      display: flex; flex-direction: column;
+      position: relative; overflow: hidden;
+    }
+    .cam-label {
+      position: absolute; top: 6px; left: 8px; z-index: 2;
+      font-size: 0.72rem; color: #ccc;
+      background: rgba(0,0,0,0.55);
+      padding: 2px 7px; border-radius: 4px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .cam-label .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #555;
+    }
+    .cam-label .dot.live { background: #4caf50; }
+    .cam-label .dot.err  { background: #f44336; }
+
+    .cam-canvas-wrap {
       flex: 1; display: flex;
       align-items: center; justify-content: center;
-      background: #111; position: relative;
+      position: relative;
     }
-    canvas#screen { max-width: 100%; max-height: 100%; display: block; }
-    #no-signal { position: absolute; color: #444; font-size: 0.85rem; }
+    .cam-canvas { max-width: 100%; max-height: 100%; display: block; }
+    .no-signal {
+      position: absolute; color: #444; font-size: 0.82rem;
+    }
+    .cam-stat {
+      padding: 3px 8px; background: #0e0e0e;
+      border-top: 1px solid #1e1e1e;
+      font-size: 0.68rem; color: #555;
+      display: flex; gap: 12px; flex-shrink: 0;
+    }
+    .cam-stat b { color: #777; }
+
+    /* ── 이벤트 패널 ── */
     .event-panel {
-      width: 260px; background: #111;
+      width: 240px; background: #111;
       display: flex; flex-direction: column;
       border-left: 1px solid #2a2a2a; flex-shrink: 0;
     }
@@ -57,198 +97,235 @@
     .ev.online  { border-left: 2px solid #4caf50; }
     #event-log::-webkit-scrollbar { width: 3px; }
     #event-log::-webkit-scrollbar-thumb { background: #333; }
-    .stat-bar {
-      display: flex; gap: 16px; padding: 5px 16px;
-      background: #1a1a1a; border-top: 1px solid #2a2a2a;
-      font-size: 0.72rem; color: #555; flex-shrink: 0;
-    }
-    .stat-bar span b { color: #888; }
   </style>
 </head>
 <body>
 
 <header>
   <h1>CCTV Monitor</h1>
-  <span class="badge" id="cam-badge">카메라 —</span>
-  <span class="badge" id="broker-badge">브로커 —</span>
   <span class="badge" id="ws-badge">연결 중...</span>
 </header>
 
 <div class="main">
-  <div class="video-wrap">
-    <span id="no-signal">신호 없음</span>
-    <canvas id="screen" width="640" height="480"></canvas>
-  </div>
+  <div id="cam-grid"></div>
   <div class="event-panel">
     <h2>Event Log</h2>
     <div id="event-log"></div>
   </div>
 </div>
 
-<div class="stat-bar">
-  <span>FPS: <b id="fps-val">—</b></span>
-  <span>프레임: <b id="frame-cnt">0</b></span>
-  <span>크기: <b id="frame-size">—</b></span>
-  <span>지연: <b id="render-ms">—</b></span>
-</div>
-
 <script>
 const WS_URL = `ws://${location.hostname}:8765`;
 
-const canvas   = document.getElementById('screen');
-const ctx      = canvas.getContext('2d');
-const noSignal = document.getElementById('no-signal');
-const evLog    = document.getElementById('event-log');
-const wsBadge  = document.getElementById('ws-badge');
-const camBadge = document.getElementById('cam-badge');
-const brokerBadge = document.getElementById('broker-badge');
+/* ─────────────────────────────────────────────────────────────
+ * 카메라 상태 맵:  camId → { canvas, ctx, pending, rendering,
+ *                            lastRenderTime, frameCount,
+ *                            fpsTimer, elFps, elFrames,
+ *                            elSize, elMs, elDot }
+ * ───────────────────────────────────────────────────────────── */
+const cameras = new Map();
+
+const TARGET_FPS = 15;
+const FRAME_MS   = 1000 / TARGET_FPS;
+
+/* ── 그리드 레이아웃 재계산 ── */
+function updateGrid() {
+  const n    = cameras.size;
+  const grid = document.getElementById('cam-grid');
+  if (n === 0) return;
+  if (n === 1) {
+    grid.style.gridTemplateColumns = '1fr';
+    grid.style.gridTemplateRows    = '1fr';
+  } else if (n === 2) {
+    grid.style.gridTemplateColumns = '1fr 1fr';
+    grid.style.gridTemplateRows    = '1fr';
+  } else if (n <= 4) {
+    grid.style.gridTemplateColumns = '1fr 1fr';
+    grid.style.gridTemplateRows    = 'repeat(2, 1fr)';
+  } else {
+    const cols = Math.ceil(Math.sqrt(n));
+    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    grid.style.gridTemplateRows    = `repeat(${Math.ceil(n/cols)}, 1fr)`;
+  }
+}
+
+/* ── 카메라 셀 생성 ── */
+function createCameraCell(camId) {
+  const grid = document.getElementById('cam-grid');
+
+  const cell = document.createElement('div');
+  cell.className = 'cam-cell';
+  cell.id = `cam-cell-${camId}`;
+
+  cell.innerHTML = `
+    <div class="cam-label">
+      <span class="dot" id="dot-${camId}"></span>
+      <span>${camId}</span>
+    </div>
+    <div class="cam-canvas-wrap">
+      <span class="no-signal" id="nosig-${camId}">신호 없음</span>
+      <canvas class="cam-canvas" id="canvas-${camId}" width="640" height="480"></canvas>
+    </div>
+    <div class="cam-stat">
+      <span>FPS: <b id="fps-${camId}">—</b></span>
+      <span>프레임: <b id="fcnt-${camId}">0</b></span>
+      <span>크기: <b id="fsz-${camId}">—</b></span>
+      <span>지연: <b id="fms-${camId}">—</b></span>
+    </div>
+  `;
+  grid.appendChild(cell);
+
+  const canvas = document.getElementById(`canvas-${camId}`);
+  const state = {
+    canvas,
+    ctx:             canvas.getContext('2d'),
+    pendingFrame:    null,
+    rendering:       false,
+    lastRenderTime:  0,
+    frameCount:      0,
+    totalFrames:     0,
+    fpsTimer:        Date.now(),
+    elFps:   document.getElementById(`fps-${camId}`),
+    elFrames:document.getElementById(`fcnt-${camId}`),
+    elSize:  document.getElementById(`fsz-${camId}`),
+    elMs:    document.getElementById(`fms-${camId}`),
+    elDot:   document.getElementById(`dot-${camId}`),
+    elNoSig: document.getElementById(`nosig-${camId}`),
+  };
+  cameras.set(camId, state);
+
+  /* FPS 카운터 */
+  setInterval(() => {
+    const elapsed = (Date.now() - state.fpsTimer) / 1000;
+    state.elFps.textContent =
+      elapsed > 0 ? (state.frameCount / elapsed).toFixed(1) : '—';
+    state.frameCount = 0;
+    state.fpsTimer   = Date.now();
+  }, 1000);
+
+  updateGrid();
+  return state;
+}
+
+function getOrCreateCamera(camId) {
+  return cameras.has(camId) ? cameras.get(camId) : createCameraCell(camId);
+}
 
 /* ─────────────────────────────────────────────────────────────
- * 실시간 프레임 렌더링
- *
- * 핵심 전략: "최신 프레임만 그린다"
- *   - pendingFrame: 대기 중인 최신 ArrayBuffer
- *   - rendering: 현재 decode 중인지 여부
- *
- * 새 프레임이 오면:
- *   - rendering 중이 아니면 → 즉시 렌더링 시작
- *   - rendering 중이면 → pendingFrame 교체 (이전 대기 프레임 버림)
- *
- * 이 방식으로 프레임이 큐에 쌓여 오래된 것이 나오는 문제를 방지한다.
+ * 프레임 렌더링 (카메라별 독립 상태)
  * ───────────────────────────────────────────────────────────── */
-/* 목표 FPS — publisher의 CAM_FPS와 맞춤 */
-const TARGET_FPS   = 15;
-const FRAME_MS     = 1000 / TARGET_FPS;  /* 프레임 간격 약 66ms */
-let lastRenderTime = 0;
-
-let pendingFrame = null;
-let rendering    = false;
-
-let frameCount  = 0;
-let totalFrames = 0;
-let fpsTimer    = Date.now();
-
-setInterval(() => {
-  const elapsed = (Date.now() - fpsTimer) / 1000;
-  document.getElementById('fps-val').textContent =
-    elapsed > 0 ? (frameCount / elapsed).toFixed(1) : '—';
-  frameCount = 0;
-  fpsTimer   = Date.now();
-}, 1000);
-
-async function renderFrame(arrayBuffer) {
+async function renderFrame(state, arrayBuffer) {
   const t0 = performance.now();
   try {
     const blob   = new Blob([arrayBuffer], { type: 'image/jpeg' });
     const bitmap = await createImageBitmap(blob);
 
-    if (canvas.width  !== bitmap.width ||
-        canvas.height !== bitmap.height) {
-      canvas.width  = bitmap.width;
-      canvas.height = bitmap.height;
+    if (state.canvas.width  !== bitmap.width ||
+        state.canvas.height !== bitmap.height) {
+      state.canvas.width  = bitmap.width;
+      state.canvas.height = bitmap.height;
     }
-
-    ctx.drawImage(bitmap, 0, 0);
+    state.ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
 
-    noSignal.style.display = 'none';
-    canvas.style.display   = 'block';
+    state.elNoSig.style.display = 'none';
+    state.canvas.style.display  = 'block';
 
-    frameCount++;
-    totalFrames++;
-    document.getElementById('frame-cnt').textContent = totalFrames;
-    document.getElementById('frame-size').textContent =
-      (arrayBuffer.byteLength / 1024).toFixed(1) + ' KB';
-    document.getElementById('render-ms').textContent =
-      (performance.now() - t0).toFixed(1) + ' ms';
+    state.frameCount++;
+    state.totalFrames++;
+    state.elFrames.textContent = state.totalFrames;
+    state.elSize.textContent   = (arrayBuffer.byteLength / 1024).toFixed(1) + ' KB';
+    state.elMs.textContent     = (performance.now() - t0).toFixed(1) + ' ms';
 
   } catch (e) {
     console.warn('Frame decode error:', e);
   } finally {
-    /*
-     * 렌더링 완료 후 대기 중인 최신 프레임이 있으면 바로 처리.
-     * 없으면 rendering = false로 대기 상태 복귀.
-     */
-    if (pendingFrame) {
-      const next = pendingFrame;
-      pendingFrame = null;
-      renderFrame(next);
+    if (state.pendingFrame) {
+      const next = state.pendingFrame;
+      state.pendingFrame = null;
+      renderFrame(state, next);
     } else {
-      rendering = false;
+      state.rendering = false;
     }
   }
 }
 
-function onFrame(arrayBuffer) {
-  const now = performance.now();
+function onFrame(camId, arrayBuffer) {
+  const state = getOrCreateCamera(camId);
+  const now   = performance.now();
 
-  /*
-   * FPS 제한 — TARGET_FPS 이상으로 빠르게 오는 프레임은 버린다.
-   * Publisher가 15fps로 보내도 WebSocket 버퍼에 쌓였다가
-   * 한꺼번에 처리되면 빨리감기처럼 보이는 문제를 방지한다.
-   */
-  if (now - lastRenderTime < FRAME_MS) {
-    pendingFrame = arrayBuffer;  /* 최신 프레임으로 교체만 해두고 버림 */
+  if (now - state.lastRenderTime < FRAME_MS) {
+    state.pendingFrame = arrayBuffer;
     return;
   }
-  lastRenderTime = now;
+  state.lastRenderTime = now;
 
-  if (!rendering) {
-    rendering = true;
-    renderFrame(arrayBuffer);
+  if (!state.rendering) {
+    state.rendering = true;
+    renderFrame(state, arrayBuffer);
   } else {
-    /* 렌더링 중 — 이전 대기 프레임 버리고 최신으로 교체 */
-    pendingFrame = arrayBuffer;
+    state.pendingFrame = arrayBuffer;
   }
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 이벤트/상태 처리
+ * 바이너리 파싱: [1B: id_len][cam_id][JPEG]
+ * ───────────────────────────────────────────────────────────── */
+function parseBinaryFrame(arrayBuffer) {
+  const view  = new Uint8Array(arrayBuffer);
+  const idLen = view[0];
+  const camId = String.fromCharCode(...view.slice(1, 1 + idLen));
+  const jpeg  = arrayBuffer.slice(1 + idLen);
+  return { camId, jpeg };
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * 이벤트 / 상태 처리
  * ───────────────────────────────────────────────────────────── */
 function addEvent(cls, text) {
-  const now = new Date().toLocaleTimeString();
-  const div = document.createElement('div');
+  const evLog = document.getElementById('event-log');
+  const now   = new Date().toLocaleTimeString();
+  const div   = document.createElement('div');
   div.className = `ev ${cls}`;
   div.innerHTML = `<div>${text}</div><div class="time">${now}</div>`;
   evLog.prepend(div);
-  if (evLog.children.length > 80)
-    evLog.removeChild(evLog.lastChild);
+  if (evLog.children.length > 100) evLog.removeChild(evLog.lastChild);
 }
 
 function handleEvent(json) {
   let msg;
-  try { msg = JSON.parse(json); } catch(e) {
-    console.warn('JSON parse error:', json, e);
-    return;
-  }
+  try { msg = JSON.parse(json); } catch(e) { return; }
 
   const cam  = msg.cam  || '?';
   const type = msg.type || '';
   const data = msg.data || '';
 
+  /* 카메라 셀이 없으면 미리 생성 */
+  getOrCreateCamera(cam);
+  const state = cameras.get(cam);
+
   if (type === 'event') {
-    const evtName = (typeof data === 'object' && data.event) ? data.event : '이벤트';
-    addEvent('motion', `[${cam}] ${evtName} 감지`);
+    const name = (typeof data === 'object' && data.event) ? data.event : '이벤트';
+    addEvent('motion', `[${cam}] ${name} 감지`);
 
   } else if (type === 'status') {
-    const isOnline = (data === 'online' ||
-                      (typeof data === 'object' && data.status === 'online'));
-    if (isOnline) {
+    const online = (data === 'online' ||
+                   (typeof data === 'object' && data.status === 'online'));
+    if (online) {
       addEvent('online', `[${cam}] 온라인`);
-      camBadge.textContent = `${cam} LIVE`;
-      camBadge.className   = 'badge live';
+      state.elDot.className = 'dot live';
     } else {
-      /* 오프라인 시 캔버스 건드리지 않음 — 마지막 프레임 유지 */
       addEvent('offline', `[${cam}] 오프라인`);
-      camBadge.textContent = `${cam} OFFLINE`;
-      camBadge.className   = 'badge err';
+      state.elDot.className = 'dot err';
     }
   }
 }
 
 /* ─────────────────────────────────────────────────────────────
- * WebSocket 연결 (자동 재연결)
+ * WebSocket
  * ───────────────────────────────────────────────────────────── */
+const wsBadge = document.getElementById('ws-badge');
+
 function connect() {
   const ws = new WebSocket(WS_URL);
   ws.binaryType = 'arraybuffer';
@@ -260,7 +337,8 @@ function connect() {
 
   ws.onmessage = ({ data }) => {
     if (data instanceof ArrayBuffer) {
-      onFrame(data);
+      const { camId, jpeg } = parseBinaryFrame(data);
+      onFrame(camId, jpeg);
     } else {
       handleEvent(data);
     }

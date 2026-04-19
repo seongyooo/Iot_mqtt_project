@@ -35,14 +35,11 @@
     #cam-grid {
       flex: 1; display: grid;
       gap: 2px; background: #222;
-      overflow: hidden;
+      overflow: hidden; position: relative;
     }
-    /* 카메라 수에 따라 grid-template 동적 변경 (JS에서 처리) */
-
     .cam-cell {
-      background: #111;
-      display: flex; flex-direction: column;
-      position: relative; overflow: hidden;
+      background: #111; display: flex;
+      flex-direction: column; position: relative; overflow: hidden;
     }
     .cam-label {
       position: absolute; top: 6px; left: 8px; z-index: 2;
@@ -51,22 +48,15 @@
       padding: 2px 7px; border-radius: 4px;
       display: flex; align-items: center; gap: 6px;
     }
-    .cam-label .dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: #555;
-    }
+    .cam-label .dot { width: 6px; height: 6px; border-radius: 50%; background: #555; }
     .cam-label .dot.live { background: #4caf50; }
     .cam-label .dot.err  { background: #f44336; }
-
     .cam-canvas-wrap {
       flex: 1; display: flex;
-      align-items: center; justify-content: center;
-      position: relative;
+      align-items: center; justify-content: center; position: relative;
     }
     .cam-canvas { max-width: 100%; max-height: 100%; display: block; }
-    .no-signal {
-      position: absolute; color: #444; font-size: 0.82rem;
-    }
+    .no-signal  { position: absolute; color: #444; font-size: 0.82rem; }
     .cam-stat {
       padding: 3px 8px; background: #0e0e0e;
       border-top: 1px solid #1e1e1e;
@@ -77,7 +67,7 @@
 
     /* ── 이벤트 패널 ── */
     .event-panel {
-      width: 240px; background: #111;
+      width: 220px; background: #111;
       display: flex; flex-direction: column;
       border-left: 1px solid #2a2a2a; flex-shrink: 0;
     }
@@ -95,8 +85,38 @@
     .ev.motion  { border-left: 2px solid #ff9800; }
     .ev.offline { border-left: 2px solid #f44336; }
     .ev.online  { border-left: 2px solid #4caf50; }
+    .ev.route   { border-left: 2px solid #2196f3; }
     #event-log::-webkit-scrollbar { width: 3px; }
     #event-log::-webkit-scrollbar-thumb { background: #333; }
+
+    /* ── 아키텍처 다이어그램 오버레이 ── */
+    #arch-panel {
+      position: absolute;
+      bottom: 8px; right: 8px;
+      background: rgba(8, 8, 8, 0.90);
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      z-index: 20;
+      backdrop-filter: blur(4px);
+    }
+    .arch-title {
+      font-size: 0.63rem; color: #444;
+      text-transform: uppercase; letter-spacing: 0.8px;
+      margin-bottom: 8px;
+    }
+    #arch-svg { display: block; }
+    #route-info {
+      margin-top: 8px; display: flex;
+      flex-direction: column; gap: 3px;
+    }
+    .route-item {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 0.68rem; color: #555;
+    }
+    .route-cam  { color: #888; min-width: 28px; }
+    .route-path { color: #4caf50; font-family: monospace; }
+    .route-path.changed { color: #ff9800; }
   </style>
 </head>
 <body>
@@ -107,7 +127,33 @@
 </header>
 
 <div class="main">
-  <div id="cam-grid"></div>
+  <div id="cam-grid">
+
+    <!-- ── 아키텍처 다이어그램 오버레이 ── -->
+    <div id="arch-panel">
+      <div class="arch-title">Network Path</div>
+      <svg id="arch-svg"
+           viewBox="0 0 315 170"
+           width="315" height="170"
+           xmlns="http://www.w3.org/2000/svg">
+
+        <!-- Arrow marker -->
+        <defs>
+          <marker id="arrow" markerWidth="6" markerHeight="6"
+                  refX="5" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L6,3 z" fill="#333"/>
+          </marker>
+          <marker id="arrow-active" markerWidth="6" markerHeight="6"
+                  refX="5" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L6,3 z" fill="#4caf50"/>
+          </marker>
+        </defs>
+      </svg>
+      <div id="route-info"></div>
+    </div>
+
+  </div>
+
   <div class="event-panel">
     <h2>Event Log</h2>
     <div id="event-log"></div>
@@ -118,17 +164,196 @@
 const WS_URL = `ws://${location.hostname}:8765`;
 
 /* ─────────────────────────────────────────────────────────────
- * 카메라 상태 맵:  camId → { canvas, ctx, pending, rendering,
- *                            lastRenderTime, frameCount,
- *                            fpsTimer, elFps, elFrames,
- *                            elSize, elMs, elDot }
+ * 아키텍처 다이어그램 정의
+ * ───────────────────────────────────────────────────────────── */
+const ARCH_NODES = {
+  pub1: { x: 22,  y: 42,  label: 'Pub1', kind: 'pub'    },
+  pub2: { x: 22,  y: 128, label: 'Pub2', kind: 'pub'    },
+  b1:   { x: 105, y: 42,  label: 'B1',   kind: 'broker' },
+  b2:   { x: 105, y: 128, label: 'B2',   kind: 'broker' },
+  b3:   { x: 210, y: 42,  label: 'B3',   kind: 'broker' },
+  b4:   { x: 210, y: 128, label: 'B4',   kind: 'broker' },
+  sub:  { x: 292, y: 85,  label: 'Sub',  kind: 'sub'    },
+};
+
+const ARCH_EDGES = [
+  { id: 'pub1-b1', from: 'pub1', to: 'b1', dash: true  },
+  { id: 'pub1-b2', from: 'pub1', to: 'b2', dash: true  },
+  { id: 'pub2-b1', from: 'pub2', to: 'b1', dash: true  },
+  { id: 'pub2-b2', from: 'pub2', to: 'b2', dash: true  },
+  { id: 'b1-b3',   from: 'b1',   to: 'b3', dash: false },
+  { id: 'b1-b4',   from: 'b1',   to: 'b4', dash: false },
+  { id: 'b2-b3',   from: 'b2',   to: 'b3', dash: false },
+  { id: 'b2-b4',   from: 'b2',   to: 'b4', dash: false },
+  { id: 'b3-sub',  from: 'b3',   to: 'sub', dash: true },
+  { id: 'b4-sub',  from: 'b4',   to: 'sub', dash: true },
+];
+
+/* ── 노드 색상 ── */
+const NODE_COLORS = {
+  pub:    '#e67e22',   /* 주황 - publisher */
+  sub:    '#2196f3',   /* 파랑 - subscriber */
+  broker: {
+    unknown:  '#3a3a3a',
+    active:   '#4caf50',
+    inactive: '#f44336',
+  }
+};
+
+/* ── 아키텍처 상태 ── */
+const archState = {
+  brokers:   { b1: 'unknown', b2: 'unknown', b3: 'unknown', b4: 'unknown' },
+  camRoutes: {},      /* cam_id → { from, via } */
+  subBroker: null,
+};
+
+/* ── cam → pub 매핑 ── */
+function camToPub(camId) {
+  return camId === 'pi1' ? 'pub1' : 'pub2';
+}
+
+/* ── 활성 edge set 계산 ── */
+function getActiveEdges() {
+  const active = new Set();
+  for (const [cam, route] of Object.entries(archState.camRoutes)) {
+    const pub  = camToPub(cam);
+    const from = route.from;   // b1 or b2
+    const via  = route.via;    // b3 or b4
+    active.add(`${pub}-${from}`);
+    active.add(`${from}-${via}`);
+    active.add(`${via}-sub`);
+  }
+  return active;
+}
+
+/* ── 다이어그램 업데이트 ── */
+function updateDiagram() {
+  const activeEdges = getActiveEdges();
+
+  /* 엣지 색상 업데이트 */
+  for (const e of ARCH_EDGES) {
+    const el = document.getElementById(`edge-${e.id}`);
+    if (!el) continue;
+    const isActive = activeEdges.has(e.id);
+    el.setAttribute('stroke', isActive ? '#4caf50' : '#2a2a2a');
+    el.setAttribute('stroke-width', isActive ? '2' : '1');
+    el.setAttribute('opacity', isActive ? '1' : '0.4');
+    el.setAttribute('marker-end',
+      isActive ? 'url(#arrow-active)' : 'url(#arrow)');
+  }
+
+  /* 브로커 노드 색상 업데이트 */
+  for (const [broker, status] of Object.entries(archState.brokers)) {
+    const el = document.getElementById(`node-${broker}`);
+    if (!el) continue;
+    el.setAttribute('fill', NODE_COLORS.broker[status]);
+  }
+
+  /* Sub 노드: 연결된 브로커에 맞게 테두리 강조 */
+  const subEl = document.getElementById('node-sub');
+  if (subEl) {
+    const hasCam = Object.keys(archState.camRoutes).length > 0;
+    subEl.setAttribute('fill', hasCam ? '#2196f3' : '#1a4a7a');
+  }
+
+  /* 라우트 정보 텍스트 업데이트 */
+  updateRouteInfo();
+}
+
+function updateRouteInfo() {
+  const el = document.getElementById('route-info');
+  el.innerHTML = '';
+  for (const [cam, route] of Object.entries(archState.camRoutes)) {
+    const div = document.createElement('div');
+    div.className = 'route-item';
+    div.innerHTML =
+      `<span class="route-cam">${cam}</span>` +
+      `<span class="route-path">${route.from} → ${route.via} → sub</span>`;
+    el.appendChild(div);
+  }
+  if (Object.keys(archState.camRoutes).length === 0) {
+    el.innerHTML = '<div class="route-item"><span style="color:#333">경로 대기 중...</span></div>';
+  }
+}
+
+/* ── SVG 다이어그램 초기 빌드 ── */
+function buildArchSVG() {
+  const svg = document.getElementById('arch-svg');
+  const R   = 15;   /* 노드 반지름 */
+
+  /* 엣지 먼저 그리기 (노드 뒤) */
+  for (const e of ARCH_EDGES) {
+    const fn = ARCH_NODES[e.from];
+    const tn = ARCH_NODES[e.to];
+
+    /* 노드 반지름만큼 짧게 끊기 */
+    const dx  = tn.x - fn.x;
+    const dy  = tn.y - fn.y;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    const ux  = dx / len;
+    const uy  = dy / len;
+
+    const x1 = fn.x + ux * R;
+    const y1 = fn.y + uy * R;
+    const x2 = tn.x - ux * (R + 4);
+    const y2 = tn.y - uy * (R + 4);
+
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('id', `edge-${e.id}`);
+    line.setAttribute('x1', x1.toFixed(1));
+    line.setAttribute('y1', y1.toFixed(1));
+    line.setAttribute('x2', x2.toFixed(1));
+    line.setAttribute('y2', y2.toFixed(1));
+    line.setAttribute('stroke', '#2a2a2a');
+    line.setAttribute('stroke-width', '1');
+    line.setAttribute('opacity', '0.4');
+    if (e.dash)
+      line.setAttribute('stroke-dasharray', '4,3');
+    line.setAttribute('marker-end', 'url(#arrow)');
+    svg.appendChild(line);
+  }
+
+  /* 노드 그리기 */
+  for (const [id, n] of Object.entries(ARCH_NODES)) {
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('id', `node-${id}`);
+    circle.setAttribute('cx', n.x);
+    circle.setAttribute('cy', n.y);
+    circle.setAttribute('r',  R);
+    circle.setAttribute('fill',
+      n.kind === 'pub' ? NODE_COLORS.pub :
+      n.kind === 'sub' ? '#1a4a7a' :
+      NODE_COLORS.broker.unknown);
+    circle.setAttribute('stroke', '#111');
+    circle.setAttribute('stroke-width', '1.5');
+    g.appendChild(circle);
+
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', n.x);
+    text.setAttribute('y', n.y + 1);
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('dominant-baseline', 'middle');
+    text.setAttribute('fill', '#eee');
+    text.setAttribute('font-size', '9');
+    text.setAttribute('font-weight', '600');
+    text.setAttribute('font-family', 'monospace');
+    text.setAttribute('pointer-events', 'none');
+    text.textContent = n.label;
+    g.appendChild(text);
+
+    svg.appendChild(g);
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * 카메라 셀 관리
  * ───────────────────────────────────────────────────────────── */
 const cameras = new Map();
-
 const TARGET_FPS = 15;
 const FRAME_MS   = 1000 / TARGET_FPS;
 
-/* ── 그리드 레이아웃 재계산 ── */
 function updateGrid() {
   const n    = cameras.size;
   const grid = document.getElementById('cam-grid');
@@ -139,9 +364,6 @@ function updateGrid() {
   } else if (n === 2) {
     grid.style.gridTemplateColumns = '1fr 1fr';
     grid.style.gridTemplateRows    = '1fr';
-  } else if (n <= 4) {
-    grid.style.gridTemplateColumns = '1fr 1fr';
-    grid.style.gridTemplateRows    = 'repeat(2, 1fr)';
   } else {
     const cols = Math.ceil(Math.sqrt(n));
     grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
@@ -149,14 +371,11 @@ function updateGrid() {
   }
 }
 
-/* ── 카메라 셀 생성 ── */
 function createCameraCell(camId) {
   const grid = document.getElementById('cam-grid');
-
   const cell = document.createElement('div');
   cell.className = 'cam-cell';
   cell.id = `cam-cell-${camId}`;
-
   cell.innerHTML = `
     <div class="cam-label">
       <span class="dot" id="dot-${camId}"></span>
@@ -164,41 +383,39 @@ function createCameraCell(camId) {
     </div>
     <div class="cam-canvas-wrap">
       <span class="no-signal" id="nosig-${camId}">신호 없음</span>
-      <canvas class="cam-canvas" id="canvas-${camId}" width="640" height="480"></canvas>
+      <canvas class="cam-canvas" id="canvas-${camId}"
+              width="640" height="480"></canvas>
     </div>
     <div class="cam-stat">
       <span>FPS: <b id="fps-${camId}">—</b></span>
       <span>프레임: <b id="fcnt-${camId}">0</b></span>
       <span>크기: <b id="fsz-${camId}">—</b></span>
       <span>지연: <b id="fms-${camId}">—</b></span>
-    </div>
-  `;
-  grid.appendChild(cell);
+    </div>`;
+
+  /* arch-panel 앞에 삽입 */
+  const archPanel = document.getElementById('arch-panel');
+  grid.insertBefore(cell, archPanel);
 
   const canvas = document.getElementById(`canvas-${camId}`);
   const state = {
-    canvas,
-    ctx:             canvas.getContext('2d'),
-    pendingFrame:    null,
-    rendering:       false,
-    lastRenderTime:  0,
-    frameCount:      0,
-    totalFrames:     0,
-    fpsTimer:        Date.now(),
-    elFps:   document.getElementById(`fps-${camId}`),
-    elFrames:document.getElementById(`fcnt-${camId}`),
-    elSize:  document.getElementById(`fsz-${camId}`),
-    elMs:    document.getElementById(`fms-${camId}`),
-    elDot:   document.getElementById(`dot-${camId}`),
-    elNoSig: document.getElementById(`nosig-${camId}`),
+    canvas, ctx: canvas.getContext('2d'),
+    pendingFrame: null, rendering: false,
+    lastRenderTime: 0, frameCount: 0, totalFrames: 0,
+    fpsTimer: Date.now(),
+    elFps:    document.getElementById(`fps-${camId}`),
+    elFrames: document.getElementById(`fcnt-${camId}`),
+    elSize:   document.getElementById(`fsz-${camId}`),
+    elMs:     document.getElementById(`fms-${camId}`),
+    elDot:    document.getElementById(`dot-${camId}`),
+    elNoSig:  document.getElementById(`nosig-${camId}`),
   };
   cameras.set(camId, state);
 
-  /* FPS 카운터 */
   setInterval(() => {
     const elapsed = (Date.now() - state.fpsTimer) / 1000;
-    state.elFps.textContent =
-      elapsed > 0 ? (state.frameCount / elapsed).toFixed(1) : '—';
+    state.elFps.textContent = elapsed > 0 ?
+      (state.frameCount / elapsed).toFixed(1) : '—';
     state.frameCount = 0;
     state.fpsTimer   = Date.now();
   }, 1000);
@@ -212,14 +429,13 @@ function getOrCreateCamera(camId) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 프레임 렌더링 (카메라별 독립 상태)
+ * 프레임 렌더링
  * ───────────────────────────────────────────────────────────── */
 async function renderFrame(state, arrayBuffer) {
   const t0 = performance.now();
   try {
     const blob   = new Blob([arrayBuffer], { type: 'image/jpeg' });
     const bitmap = await createImageBitmap(blob);
-
     if (state.canvas.width  !== bitmap.width ||
         state.canvas.height !== bitmap.height) {
       state.canvas.width  = bitmap.width;
@@ -227,17 +443,14 @@ async function renderFrame(state, arrayBuffer) {
     }
     state.ctx.drawImage(bitmap, 0, 0);
     bitmap.close();
-
     state.elNoSig.style.display = 'none';
     state.canvas.style.display  = 'block';
-
     state.frameCount++;
     state.totalFrames++;
     state.elFrames.textContent = state.totalFrames;
-    state.elSize.textContent   = (arrayBuffer.byteLength / 1024).toFixed(1) + ' KB';
-    state.elMs.textContent     = (performance.now() - t0).toFixed(1) + ' ms';
-
-  } catch (e) {
+    state.elSize.textContent   = (arrayBuffer.byteLength/1024).toFixed(1) + ' KB';
+    state.elMs.textContent     = (performance.now()-t0).toFixed(1) + ' ms';
+  } catch(e) {
     console.warn('Frame decode error:', e);
   } finally {
     if (state.pendingFrame) {
@@ -253,13 +466,10 @@ async function renderFrame(state, arrayBuffer) {
 function onFrame(camId, arrayBuffer) {
   const state = getOrCreateCamera(camId);
   const now   = performance.now();
-
   if (now - state.lastRenderTime < FRAME_MS) {
-    state.pendingFrame = arrayBuffer;
-    return;
+    state.pendingFrame = arrayBuffer; return;
   }
   state.lastRenderTime = now;
-
   if (!state.rendering) {
     state.rendering = true;
     renderFrame(state, arrayBuffer);
@@ -268,9 +478,6 @@ function onFrame(camId, arrayBuffer) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────
- * 바이너리 파싱: [1B: id_len][cam_id][JPEG]
- * ───────────────────────────────────────────────────────────── */
 function parseBinaryFrame(arrayBuffer) {
   const view  = new Uint8Array(arrayBuffer);
   const idLen = view[0];
@@ -280,7 +487,7 @@ function parseBinaryFrame(arrayBuffer) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * 이벤트 / 상태 처리
+ * 이벤트 로그
  * ───────────────────────────────────────────────────────────── */
 function addEvent(cls, text) {
   const evLog = document.getElementById('event-log');
@@ -292,37 +499,81 @@ function addEvent(cls, text) {
   if (evLog.children.length > 100) evLog.removeChild(evLog.lastChild);
 }
 
-function handleEvent(json) {
+/* ─────────────────────────────────────────────────────────────
+ * WebSocket 메시지 처리
+ * ───────────────────────────────────────────────────────────── */
+function handleTextMessage(json) {
   let msg;
   try { msg = JSON.parse(json); } catch(e) { return; }
 
   const cam  = msg.cam  || '?';
   const type = msg.type || '';
   const data = msg.data || '';
+  const from = msg.from || '';
+  const via  = msg.via  || '';
 
-  /* 카메라 셀이 없으면 미리 생성 */
-  getOrCreateCamera(cam);
-  const state = cameras.get(cam);
+  /* ── 라우팅 경로 변경 ── */
+  if (type === 'route') {
+    const prev = archState.camRoutes[cam];
+    const prevPath = prev ? `${prev.from}→${prev.via}` : null;
+    archState.camRoutes[cam] = { from: msg.from, via: msg.via };
+    archState.brokers[msg.from] = 'active';
+    archState.brokers[msg.via]  = 'active';
+    updateDiagram();
 
+    if (prevPath && prevPath !== `${msg.from}→${msg.via}`) {
+      addEvent('route',
+        `[${cam}] 경로 변경: ${prevPath} → ${msg.from}→${msg.via}`);
+    }
+    return;
+  }
+
+  /* ── 브로커 상태 ── */
+  if (type === 'broker_status') {
+    archState.brokers[msg.broker] = msg.active ? 'active' : 'inactive';
+    updateDiagram();
+    if (!msg.active)
+      addEvent('offline', `[${msg.broker}] 브로커 다운`);
+    else
+      addEvent('online', `[${msg.broker}] 브로커 복구`);
+    return;
+  }
+
+  /* ── Sub 연결 브로커 ── */
+  if (type === 'sub_connected') {
+    archState.subBroker = msg.broker.toLowerCase();
+    archState.brokers[archState.subBroker] = 'active';
+    updateDiagram();
+    return;
+  }
+
+  /* ── 카메라 이벤트 ── */
   if (type === 'event') {
+    getOrCreateCamera(cam);
     const name = (typeof data === 'object' && data.event) ? data.event : '이벤트';
-    addEvent('motion', `[${cam}] ${name} 감지`);
+    const pathStr = (from && via) ? ` (${from}→${via})` : '';
+    addEvent('motion', `[${cam}] ${name} 감지${pathStr}`);
 
   } else if (type === 'status') {
+    getOrCreateCamera(cam);
+    const state = cameras.get(cam);
     const online = (data === 'online' ||
                    (typeof data === 'object' && data.status === 'online'));
     if (online) {
       addEvent('online', `[${cam}] 온라인`);
-      state.elDot.className = 'dot live';
+      if (state) state.elDot.className = 'dot live';
     } else {
       addEvent('offline', `[${cam}] 오프라인`);
-      state.elDot.className = 'dot err';
+      if (state) state.elDot.className = 'dot err';
+      /* 카메라 오프라인 시 라우팅에서 제거 */
+      delete archState.camRoutes[cam];
+      updateDiagram();
     }
   }
 }
 
 /* ─────────────────────────────────────────────────────────────
- * WebSocket
+ * WebSocket 연결
  * ───────────────────────────────────────────────────────────── */
 const wsBadge = document.getElementById('ws-badge');
 
@@ -340,7 +591,7 @@ function connect() {
       const { camId, jpeg } = parseBinaryFrame(data);
       onFrame(camId, jpeg);
     } else {
-      handleEvent(data);
+      handleTextMessage(data);
     }
   };
 
@@ -353,6 +604,11 @@ function connect() {
   ws.onerror = () => ws.close();
 }
 
+/* ─────────────────────────────────────────────────────────────
+ * 초기화
+ * ───────────────────────────────────────────────────────────── */
+buildArchSVG();
+updateRouteInfo();
 connect();
 </script>
 </body>

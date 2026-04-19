@@ -1,7 +1,26 @@
 /*
  * subscriber_ws.c
  *
- * Build:
+ * MQTT 서브스크라이버 + WebSocket 브릿지.
+ * Core 브로커(B3, B4)에 연결해 카메라 데이터를 수신하고,
+ * WebSocket을 통해 브라우저 클라이언트에 실시간으로 전달한다.
+ *
+ * 메시지 라우팅:
+ *   MQTT 토픽 형식: <edge>/<core>/camera/<cam_id>/<type>
+ *     예) b1/b3/camera/pi1/frame
+ *   경로 정보를 파싱해 브로커 활성 상태를 추적하고,
+ *   경로 변경 시 브라우저에 알림을 전송한다.
+ *
+ * WebSocket으로 전송하는 메시지 타입:
+ *   Binary  - 카메라 프레임: [1B: cam_id 길이][cam_id][JPEG 바이너리]
+ *   Text/JSON:
+ *     { type: "route",         cam, from, via }
+ *     { type: "broker_status", broker, active }
+ *     { type: "sub_connected", broker }
+ *     { type: "event",         cam, from, via, data }
+ *     { type: "status",        cam, from, via, data }
+ *
+ * 빌드:
  *   gcc -Wall -O2 -o subscriber_ws subscriber_ws.c \
  *       -lmosquitto -lws -lpthread
  */
@@ -15,23 +34,32 @@
 #include <mosquitto.h>
 #include <wsserver/ws.h>
 
-/* ── WebSocket 포트 ── */
-#define WS_PORT 8765
+/* -----------------------------------------------------------------
+ * 설정값
+ * ----------------------------------------------------------------- */
+#define WS_PORT             8765
+#define CONNECT_TIMEOUT_SEC    3   /* TCP 페일오버 타임아웃 (초) */
+#define BROKER_TIMEOUT_SEC     5   /* 수신 없으면 inactive 처리 (초) */
 
-/* ── Sub는 Core 브로커(B3, B4)에만 연결 ── */
+/* -----------------------------------------------------------------
+ * Core 브로커 목록
+ * 서브스크라이버는 Core 브로커(B3, B4)에만 연결한다.
+ * Edge 브로커(B1, B2)의 트래픽은 MQTT 브릿지를 통해 여기로 전달된다.
+ * ----------------------------------------------------------------- */
 typedef struct { const char *host; int port; const char *label; } broker_t;
+
 static const broker_t BROKERS[] = {
     { "192.168.0.13", 1883, "B3" },
     { "192.168.0.29", 1883, "B4" },
 };
-#define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
-#define CONNECT_TIMEOUT_SEC  3
-#define BROKER_TIMEOUT_SEC   5   /* 수신 없으면 inactive */
+#define BROKER_COUNT (int)(sizeof(BROKERS) / sizeof(BROKERS[0]))
 
-/* ── 구독 토픽: prefix 포함 전체 ── */
+/* 모든 카메라 토픽 구독 (edge/core 경로 포함) */
 #define TOPIC_ALL "+/+/camera/#"
 
-/* ── 전역 MQTT 상태 ── */
+/* -----------------------------------------------------------------
+ * 전역 MQTT 상태
+ * ----------------------------------------------------------------- */
 static int              g_broker_idx    = 0;
 static int              g_connected     = 0;
 static volatile int     g_need_failover = 0;
@@ -39,27 +67,36 @@ static time_t           g_connect_start = 0;
 static struct mosquitto *g_mosq         = NULL;
 static pthread_mutex_t  g_mutex         = PTHREAD_MUTEX_INITIALIZER;
 
-/* ─────────────────────────────────────────
- * 카메라 라우팅 상태 추적
- * ───────────────────────────────────────── */
+/* -----------------------------------------------------------------
+ * 카메라별 라우팅 상태
+ * 각 카메라의 마지막 edge/core 브로커 쌍을 저장한다.
+ * 경로가 변경되면 WebSocket 클라이언트에 브로드캐스트한다.
+ * ----------------------------------------------------------------- */
 #define MAX_CAMS 10
+
 typedef struct {
     char cam_id[16];
-    char last_from[8];   /* 마지막 edge broker: b1 or b2 */
-    char last_via[8];    /* 마지막 core broker: b3 or b4 */
-} CamStatus;
+    char last_from[8];   /* 마지막 Edge 브로커 (예: "b1") */
+    char last_via[8];    /* 마지막 Core 브로커 (예: "b3") */
+} cam_status_t;
 
-static CamStatus       g_cam_status[MAX_CAMS];
-static int             g_cam_count = 0;
-static pthread_mutex_t g_cam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static cam_status_t    g_cam_status[MAX_CAMS];
+static int             g_cam_count  = 0;
+static pthread_mutex_t g_cam_mutex  = PTHREAD_MUTEX_INITIALIZER;
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------------------------------
  * 브로커별 마지막 수신 시각
- * b1=0, b2=1, b3=2, b4=3
- * ───────────────────────────────────────── */
-static time_t          g_broker_seen[4] = {0};
+ * 인덱스: b1=0, b2=1, b3=2, b4=3
+ * watchdog 스레드가 이 값으로 inactive 상태를 감지한다.
+ * ----------------------------------------------------------------- */
+static time_t          g_broker_seen[4] = { 0 };
 static pthread_mutex_t g_broker_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
+/* -----------------------------------------------------------------
+ * broker_to_idx
+ * 브로커 레이블을 g_broker_seen[] 인덱스로 변환한다.
+ * 알 수 없는 레이블은 -1을 반환한다.
+ * ----------------------------------------------------------------- */
 static int broker_to_idx(const char *name)
 {
     if (strcasecmp(name, "b1") == 0) return 0;
@@ -69,52 +106,61 @@ static int broker_to_idx(const char *name)
     return -1;
 }
 
-/* ─────────────────────────────────────────
- * 토픽 파싱: b1/b3/camera/pi1/frame
- *   → from=b1, via=b3, cam=pi1, type=frame
- * ───────────────────────────────────────── */
+/* -----------------------------------------------------------------
+ * parse_topic
+ * "<edge>/<core>/camera/<cam>/<type>" 형식의 토픽을 파싱한다.
+ * 성공 시 0, 형식 불일치 시 -1을 반환한다.
+ * ----------------------------------------------------------------- */
 static int parse_topic(const char *topic,
-                        char *from, char *via,
-                        char *cam,  char *type)
+                       char *from, char *via,
+                       char *cam,  char *type)
 {
-    return (sscanf(topic,
-                   "%7[^/]/%7[^/]/camera/%15[^/]/%15s",
+    return (sscanf(topic, "%7[^/]/%7[^/]/camera/%15[^/]/%15s",
                    from, via, cam, type) == 4) ? 0 : -1;
 }
 
-/* ─────────────────────────────────────────
- * 라우팅 경로 변경 감지 → WebSocket 알림
- * ───────────────────────────────────────── */
+/* -----------------------------------------------------------------
+ * update_route
+ * 카메라의 라우팅 경로를 갱신한다.
+ * 경로가 변경된 경우 모든 WebSocket 클라이언트에 JSON을 브로드캐스트한다.
+ * ----------------------------------------------------------------- */
 static void update_route(const char *cam_id,
-                          const char *from, const char *via)
+                         const char *from, const char *via)
 {
     pthread_mutex_lock(&g_cam_mutex);
 
+    /* 해당 카메라 슬롯을 찾거나 새로 생성 */
     int ci = -1;
-    for (int i = 0; i < g_cam_count; i++)
-        if (strcmp(g_cam_status[i].cam_id, cam_id) == 0) { ci = i; break; }
-
+    for (int i = 0; i < g_cam_count; i++) {
+        if (strcmp(g_cam_status[i].cam_id, cam_id) == 0) {
+            ci = i;
+            break;
+        }
+    }
     if (ci < 0 && g_cam_count < MAX_CAMS) {
         ci = g_cam_count++;
-        strncpy(g_cam_status[ci].cam_id, cam_id, 15);
+        strncpy(g_cam_status[ci].cam_id, cam_id, sizeof(g_cam_status[ci].cam_id) - 1);
         g_cam_status[ci].last_from[0] = '\0';
         g_cam_status[ci].last_via[0]  = '\0';
     }
-    if (ci < 0) { pthread_mutex_unlock(&g_cam_mutex); return; }
+    if (ci < 0) {
+        pthread_mutex_unlock(&g_cam_mutex);
+        return;
+    }
 
     int changed = (strcmp(g_cam_status[ci].last_from, from) != 0 ||
                    strcmp(g_cam_status[ci].last_via,  via)  != 0);
+
     if (changed) {
-        printf("[Route Changed] cam=%s: %s→%s → %s→%s\n",
+        printf("[Route] cam=%s: %s->%s => %s->%s\n",
                cam_id,
                g_cam_status[ci].last_from[0] ? g_cam_status[ci].last_from : "?",
                g_cam_status[ci].last_via[0]  ? g_cam_status[ci].last_via  : "?",
                from, via);
 
-        strncpy(g_cam_status[ci].last_from, from, 7);
-        strncpy(g_cam_status[ci].last_via,  via,  7);
+        strncpy(g_cam_status[ci].last_from, from, sizeof(g_cam_status[ci].last_from) - 1);
+        strncpy(g_cam_status[ci].last_via,  via,  sizeof(g_cam_status[ci].last_via)  - 1);
 
-        /* 브라우저에 경로 변경 알림 */
         char json[256];
         snprintf(json, sizeof(json),
                  "{\"type\":\"route\",\"cam\":\"%s\","
@@ -122,54 +168,65 @@ static void update_route(const char *cam_id,
                  cam_id, from, via);
         ws_sendframe_bcast(WS_PORT, json, strlen(json), WS_FR_OP_TXT);
     }
+
     pthread_mutex_unlock(&g_cam_mutex);
 }
 
-/* ─────────────────────────────────────────
- * 브로커 Watchdog 스레드
- * 수신 타임아웃 → inactive 알림
- * ───────────────────────────────────────── */
+/* -----------------------------------------------------------------
+ * broker_watchdog (스레드)
+ * 2초마다 g_broker_seen[]을 확인해 타임아웃된 브로커를 감지하고,
+ * 활성/비활성 상태가 바뀌면 WebSocket 클라이언트에 알린다.
+ * ----------------------------------------------------------------- */
 static void *broker_watchdog(void *arg)
 {
     (void)arg;
-    const char *names[]  = {"b1","b2","b3","b4"};
-    int prev_active[4]   = {-1,-1,-1,-1};
+    const char *names[]  = { "b1", "b2", "b3", "b4" };
+    int         prev[4]  = { -1, -1, -1, -1 };
 
     while (1) {
         sleep(2);
+
         time_t now = time(NULL);
         pthread_mutex_lock(&g_broker_mutex);
+
         for (int i = 0; i < 4; i++) {
-            if (g_broker_seen[i] == 0) continue;
+            if (g_broker_seen[i] == 0)
+                continue;
+
             int active = (now - g_broker_seen[i]) < BROKER_TIMEOUT_SEC;
-            if (active != prev_active[i]) {
-                prev_active[i] = active;
+
+            if (active != prev[i]) {
+                prev[i] = active;
+
                 char json[128];
                 snprintf(json, sizeof(json),
                          "{\"type\":\"broker_status\","
                          "\"broker\":\"%s\",\"active\":%s}",
                          names[i], active ? "true" : "false");
                 ws_sendframe_bcast(WS_PORT, json, strlen(json), WS_FR_OP_TXT);
-                printf("[Broker] %s → %s\n",
+
+                printf("[Broker] %s => %s\n",
                        names[i], active ? "active" : "inactive");
             }
         }
+
         pthread_mutex_unlock(&g_broker_mutex);
     }
     return NULL;
 }
 
-/* ─────────────────────────────────────────
- * WebSocket 콜백
- * ───────────────────────────────────────── */
-void onopen(ws_cli_conn_t client)
+/* -----------------------------------------------------------------
+ * send_current_state
+ * 특정 WebSocket 클라이언트에게 현재 라우팅/브로커 상태를 전송한다.
+ * 신규 연결 시 및 request_state 수신 시 호출된다.
+ * ----------------------------------------------------------------- */
+static void send_current_state(ws_cli_conn_t client)
 {
-    printf("[WS] Connected: %s\n", ws_getaddress(client));
-
-    /* 신규 클라이언트에게 현재 라우팅 상태 즉시 전송 */
+    /* 각 카메라의 현재 라우팅 경로 */
     pthread_mutex_lock(&g_cam_mutex);
     for (int i = 0; i < g_cam_count; i++) {
-        if (!g_cam_status[i].last_from[0]) continue;
+        if (!g_cam_status[i].last_from[0])
+            continue;
         char json[256];
         snprintf(json, sizeof(json),
                  "{\"type\":\"route\",\"cam\":\"%s\","
@@ -177,87 +234,85 @@ void onopen(ws_cli_conn_t client)
                  g_cam_status[i].cam_id,
                  g_cam_status[i].last_from,
                  g_cam_status[i].last_via);
-        ws_sendframe_bcast(WS_PORT, json, strlen(json), WS_FR_OP_TXT);
+        ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
     }
     pthread_mutex_unlock(&g_cam_mutex);
+
+    /* 추적 중인 브로커의 활성 상태 */
+    const char *names[] = { "b1", "b2", "b3", "b4" };
+    pthread_mutex_lock(&g_broker_mutex);
+    time_t now = time(NULL);
+    for (int i = 0; i < 4; i++) {
+        if (g_broker_seen[i] == 0)
+            continue;
+        int active = (now - g_broker_seen[i]) < BROKER_TIMEOUT_SEC;
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"type\":\"broker_status\","
+                 "\"broker\":\"%s\",\"active\":%s}",
+                 names[i], active ? "true" : "false");
+        ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
+    }
+    pthread_mutex_unlock(&g_broker_mutex);
+
+    /* 현재 연결된 Core 브로커 정보 */
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"type\":\"sub_connected\",\"broker\":\"%s\"}",
+             BROKERS[g_broker_idx].label);
+    ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
 }
 
-void onclose(ws_cli_conn_t client) {
-    printf("[WS] Disconnected: %s\n", ws_getaddress(client));
+/* -----------------------------------------------------------------
+ * WebSocket 이벤트 콜백
+ * ----------------------------------------------------------------- */
+void onopen(ws_cli_conn_t client)
+{
+    printf("[WS] 클라이언트 연결: %s\n", ws_getaddress(client));
+    send_current_state(client);
+}
+
+void onclose(ws_cli_conn_t client)
+{
+    printf("[WS] 클라이언트 연결 해제: %s\n", ws_getaddress(client));
 }
 
 void onmessage(ws_cli_conn_t client,
                const unsigned char *msg, uint64_t size, int type)
 {
     (void)size; (void)type;
-    if (!msg) return;
+    if (!msg)
+        return;
 
-    /* 브라우저가 WS 연결 후 현재 상태 요청 */
-    if (strncmp((const char *)msg, "request_state", 13) == 0) {
-
-        /* 현재 cam 라우팅 상태 전송 */
-        pthread_mutex_lock(&g_cam_mutex);
-        for (int i = 0; i < g_cam_count; i++) {
-            if (!g_cam_status[i].last_from[0]) continue;
-            char json[256];
-            snprintf(json, sizeof(json),
-                     "{\"type\":\"route\",\"cam\":\"%s\","
-                     "\"from\":\"%s\",\"via\":\"%s\"}",
-                     g_cam_status[i].cam_id,
-                     g_cam_status[i].last_from,
-                     g_cam_status[i].last_via);
-            ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
-        }
-        pthread_mutex_unlock(&g_cam_mutex);
-
-        /* 현재 브로커 활성 상태 전송 */
-        const char *names[] = {"b1","b2","b3","b4"};
-        pthread_mutex_lock(&g_broker_mutex);
-        time_t now = time(NULL);
-        for (int i = 0; i < 4; i++) {
-            if (g_broker_seen[i] == 0) continue;
-            int active = (now - g_broker_seen[i]) < BROKER_TIMEOUT_SEC;
-            char json[128];
-            snprintf(json, sizeof(json),
-                     "{\"type\":\"broker_status\","
-                     "\"broker\":\"%s\",\"active\":%s}",
-                     names[i], active ? "true" : "false");
-            ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
-        }
-        pthread_mutex_unlock(&g_broker_mutex);
-
-        /* Sub 연결 브로커 전송 */
-        char json[128];
-        snprintf(json, sizeof(json),
-                 "{\"type\":\"sub_connected\",\"broker\":\"%s\"}",
-                 BROKERS[g_broker_idx].label);
-        ws_sendframe(client, json, strlen(json), WS_FR_OP_TXT);
-    }
+    /* 브라우저가 연결 후 상태 동기화를 요청할 때 전송 */
+    if (strncmp((const char *)msg, "request_state", 13) == 0)
+        send_current_state(client);
 }
 
-/* ─────────────────────────────────────────
- * MQTT 콜백
- * ───────────────────────────────────────── */
+/* -----------------------------------------------------------------
+ * MQTT 이벤트 콜백
+ * ----------------------------------------------------------------- */
 static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc)
 {
     (void)ud;
     if (rc != 0) {
-        fprintf(stderr, "[MQTT] Connect failed rc=%d\n", rc);
+        fprintf(stderr, "[MQTT] 연결 실패 rc=%d\n", rc);
         g_need_failover = 1;
         return;
     }
+
     g_need_failover = 0;
     pthread_mutex_lock(&g_mutex);
     g_connected = 1;
     pthread_mutex_unlock(&g_mutex);
     g_connect_start = 0;
 
-    printf("[MQTT] Connected to %s (%s)\n",
+    printf("[MQTT] 연결됨: %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
 
     mosquitto_subscribe(mosq, NULL, TOPIC_ALL, 1);
 
-    /* 브라우저에 Sub 연결 브로커 알림 */
+    /* 연결된 Core 브로커를 브라우저에 알림 */
     char json[128];
     snprintf(json, sizeof(json),
              "{\"type\":\"sub_connected\",\"broker\":\"%s\"}",
@@ -271,25 +326,29 @@ static void on_mqtt_disconnect(struct mosquitto *mosq, void *ud, int rc)
     pthread_mutex_lock(&g_mutex);
     g_connected = 0;
     pthread_mutex_unlock(&g_mutex);
+
     if (rc != 0) {
-        printf("[MQTT] Disconnected from %s. Triggering failover...\n",
+        printf("[MQTT] 연결 끊김: %s -> 페일오버 시작\n",
                BROKERS[g_broker_idx].label);
         g_need_failover = 1;
     }
 }
 
 static void on_mqtt_message(struct mosquitto *mosq, void *ud,
-                             const struct mosquitto_message *msg)
+                            const struct mosquitto_message *msg)
 {
     (void)mosq; (void)ud;
-    if (!msg->payload || msg->payloadlen <= 0) return;
-    if (msg->retain) return;
+    if (!msg->payload || msg->payloadlen <= 0)
+        return;
+    if (msg->retain)   /* retained 메시지 무시 */
+        return;
 
-    /* ── 토픽 파싱 ── */
+    /* 구조화된 토픽 파싱 */
     char from[8], via[8], cam_id[16], sub_type[16];
-    if (parse_topic(msg->topic, from, via, cam_id, sub_type) != 0) return;
+    if (parse_topic(msg->topic, from, via, cam_id, sub_type) != 0)
+        return;
 
-    /* ── 브로커 수신 시각 갱신 ── */
+    /* 경로 상 두 브로커의 마지막 수신 시각 갱신 */
     pthread_mutex_lock(&g_broker_mutex);
     int fi = broker_to_idx(from);
     int vi = broker_to_idx(via);
@@ -297,26 +356,35 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
     if (vi >= 0) g_broker_seen[vi] = time(NULL);
     pthread_mutex_unlock(&g_broker_mutex);
 
-    /* ── 라우팅 경로 변경 감지 ── */
+    /* 라우팅 경로 변경 감지 및 알림 */
     update_route(cam_id, from, via);
 
-    /* ── 메시지 타입별 처리 ── */
     if (strcmp(sub_type, "frame") == 0) {
-        /* 프레임: [1B: id_len][cam_id][JPEG] */
+        /*
+         * WebSocket 바이너리 프레임 포맷:
+         *   [1바이트: cam_id 길이][cam_id 바이트][JPEG 바이트]
+         * JSON 헤더 파싱 없이 브라우저가 카메라를 식별할 수 있도록 한다.
+         */
         uint8_t  id_len = (uint8_t)strlen(cam_id);
         size_t   total  = 1 + id_len + (size_t)msg->payloadlen;
         uint8_t *buf    = malloc(total);
-        if (!buf) return;
+        if (!buf)
+            return;
+
         buf[0] = id_len;
         memcpy(buf + 1,          cam_id,       id_len);
         memcpy(buf + 1 + id_len, msg->payload, msg->payloadlen);
+
         ws_sendframe_bcast(WS_PORT, (const char *)buf,
                            (uint64_t)total, WS_FR_OP_BIN);
         free(buf);
 
     } else {
-        /* 이벤트 / 상태: JSON 래퍼 + from/via 포함 */
-        char wrapper[1024];
+        /*
+         * 이벤트/상태 메시지는 JSON 래퍼로 감싸서 전송한다.
+         * 원본 payload가 JSON이면 객체로, 아니면 문자열로 삽입한다.
+         */
+        char        wrapper[1024];
         const char *type        = (strcmp(sub_type, "event") == 0) ? "event" : "status";
         const char *payload_str = (const char *)msg->payload;
 
@@ -335,100 +403,153 @@ static void on_mqtt_message(struct mosquitto *mosq, void *ud,
                      type, cam_id, from, via,
                      msg->payloadlen, payload_str);
         }
+
         ws_sendframe_bcast(WS_PORT, wrapper,
                            (uint64_t)strlen(wrapper), WS_FR_OP_TXT);
-        printf("[MQTT] %s/%s via %s→%s\n", type, cam_id, from, via);
+        printf("[MQTT] %s/%s via %s->%s\n", type, cam_id, from, via);
     }
 }
 
-/* ─────────────────────────────────────────
- * 콜백 설정 / mosq_stop / failover / init
- * ───────────────────────────────────────── */
-static void setup_callbacks(struct mosquitto *mosq) {
+/* -----------------------------------------------------------------
+ * setup_callbacks
+ * mosquitto 인스턴스에 MQTT 콜백을 등록한다.
+ * ----------------------------------------------------------------- */
+static void setup_callbacks(struct mosquitto *mosq)
+{
     mosquitto_connect_callback_set(mosq, on_mqtt_connect);
     mosquitto_disconnect_callback_set(mosq, on_mqtt_disconnect);
     mosquitto_message_callback_set(mosq, on_mqtt_message);
 }
 
-static void mosq_stop(struct mosquitto *mosq) {
+/* -----------------------------------------------------------------
+ * mosq_stop
+ * mosquitto 네트워크 스레드를 강제 종료한다.
+ * publisher.c의 mosq_stop과 동일한 이유로 loop_stop(true)를 사용한다.
+ * ----------------------------------------------------------------- */
+static void mosq_stop(struct mosquitto *mosq)
+{
     mosquitto_disconnect(mosq);
     mosquitto_loop_stop(mosq, true);
 }
 
-static void do_failover(void) {
+/* -----------------------------------------------------------------
+ * do_failover
+ * 다음 Core 브로커로 전환한다 (라운드로빈).
+ * ----------------------------------------------------------------- */
+static void do_failover(void)
+{
     g_broker_idx = (g_broker_idx + 1) % BROKER_COUNT;
-    printf("[Failover] Switching to %s (%s)\n",
+    printf("[Failover] %s (%s) 으로 전환\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
+
     mosq_stop(g_mosq);
     mosquitto_destroy(g_mosq);
+
     g_mosq = mosquitto_new("cctv_sub_edge_c", true, NULL);
-    if (!g_mosq) { perror("[Failover] mosquitto_new"); g_need_failover = 1; return; }
+    if (!g_mosq) {
+        perror("[Failover] mosquitto_new");
+        g_need_failover = 1;
+        return;
+    }
+
     setup_callbacks(g_mosq);
     g_need_failover = 0;
     g_connect_start = time(NULL);
 
-    /* loop_start 를 connect_async 보다 먼저 호출 (macOS 2.1.2 퀴크) */
+    /*
+     * 일부 플랫폼(libmosquitto 2.x)에서 connect_async 이전에
+     * loop_start를 먼저 호출해야 MOSQ_ERR_NO_CONN 오류를 방지할 수 있다.
+     */
     mosquitto_loop_start(g_mosq);
 
     int rc = mosquitto_connect_async(g_mosq,
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[Failover] connect_async failed rc=%d\n", rc);
-        g_connect_start = 0; g_need_failover = 1; return;
+        fprintf(stderr, "[Failover] connect_async 실패 rc=%d (%s)\n",
+                rc, mosquitto_strerror(rc));
+        g_connect_start = 0;
+        g_need_failover = 1;
     }
 }
 
-static struct mosquitto *mqtt_init(void) {
+/* -----------------------------------------------------------------
+ * mqtt_init
+ * mosquitto를 초기화하고 첫 번째 가용 Core 브로커에 연결한다.
+ * ----------------------------------------------------------------- */
+static struct mosquitto *mqtt_init(void)
+{
     mosquitto_lib_init();
+
     struct mosquitto *mosq = mosquitto_new("cctv_sub_edge_c", true, NULL);
-    if (!mosq) { perror("mosquitto_new"); return NULL; }
+    if (!mosq) {
+        perror("mosquitto_new");
+        return NULL;
+    }
+
     setup_callbacks(mosq);
 
-    /* macOS libmosquitto 2.1.2 퀴크: loop_start 를 connect_async 이전에
-     * 호출해야 rc=14 (ENOTCONN) 가짜 에러를 피할 수 있음 */
+    /* do_failover 주석 참고: loop_start를 connect_async 이전에 호출 */
     mosquitto_loop_start(mosq);
 
     for (int i = 0; i < BROKER_COUNT; i++) {
         int rc = mosquitto_connect_async(mosq,
                                          BROKERS[i].host, BROKERS[i].port, 10);
         if (rc == MOSQ_ERR_SUCCESS) {
-            g_broker_idx = i; g_connect_start = time(NULL);
-            printf("[MQTT] Initial connect_async to %s (%s)\n",
+            g_broker_idx    = i;
+            g_connect_start = time(NULL);
+            printf("[MQTT] 초기 connect_async: %s (%s)\n",
                    BROKERS[i].host, BROKERS[i].label);
             break;
         }
     }
+
     return mosq;
 }
 
-/* ─────────────────────────────────────────
+/* -----------------------------------------------------------------
  * main
- * ───────────────────────────────────────── */
-int main(void) {
+ * ----------------------------------------------------------------- */
+int main(void)
+{
+    /* WebSocket 서버를 백그라운드 스레드로 시작 */
     ws_socket(&(struct ws_server){
-        .host = "0.0.0.0", .port = WS_PORT,
-        .thread_loop = 1, .timeout_ms = 1000,
-        .evs.onopen = &onopen, .evs.onclose = &onclose,
+        .host        = "0.0.0.0",
+        .port        = WS_PORT,
+        .thread_loop = 1,
+        .timeout_ms  = 1000,
+        .evs.onopen    = &onopen,
+        .evs.onclose   = &onclose,
         .evs.onmessage = &onmessage,
     });
-    printf("[WS] Server started on port %d\n", WS_PORT);
+    printf("[WS] 서버 시작: 포트 %d\n", WS_PORT);
 
+    /* 브로커 watchdog 스레드 시작 */
     pthread_t watchdog_tid;
     pthread_create(&watchdog_tid, NULL, broker_watchdog, NULL);
     pthread_detach(watchdog_tid);
 
+    /* MQTT 연결 */
     g_mosq = mqtt_init();
-    if (!g_mosq) return -1;
+    if (!g_mosq)
+        return 1;
 
+    /* 메인 루프: 페일오버 및 연결 타임아웃 처리 */
     while (1) {
-        if (g_need_failover) { do_failover(); continue; }
+        if (g_need_failover) {
+            do_failover();
+            continue;
+        }
+
         if (!g_connected && g_connect_start > 0 &&
             time(NULL) - g_connect_start > CONNECT_TIMEOUT_SEC) {
-            g_connect_start = 0; g_need_failover = 1;
+            g_connect_start = 0;
+            g_need_failover = 1;
         }
-        usleep(100000);
+
+        usleep(100000);   /* 100ms 폴링 간격 */
     }
+
     mosq_stop(g_mosq);
     mosquitto_destroy(g_mosq);
     mosquitto_lib_cleanup();

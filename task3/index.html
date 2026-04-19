@@ -39,7 +39,6 @@
       gap: 1px; background: #222;
     }
 
-    /* ── 카메라 그리드 ── */
     #cam-grid {
       flex: 1; display: grid;
       gap: 2px; background: #222; overflow: hidden;
@@ -71,7 +70,6 @@
     }
     .no-signal { position: absolute; color: #444; font-size: 0.82rem; }
 
-    /* ── 오프라인 오버레이 ── */
     .offline-overlay {
       position: absolute; inset: 0; z-index: 5;
       background: rgba(0,0,0,0.72);
@@ -92,7 +90,6 @@
     }
     .cam-stat b { color: #777; }
 
-    /* ── 우측 패널 ── */
     .right-panel {
       width: 340px; background: #111;
       display: flex; flex-direction: column;
@@ -122,7 +119,6 @@
     #event-log::-webkit-scrollbar { width: 3px; }
     #event-log::-webkit-scrollbar-thumb { background: #333; }
 
-    /* ── 아키텍처 다이어그램 ── */
     #arch-panel {
       flex-shrink: 0; background: #0d0d0d;
       border-top: 1px solid #2a2a2a; padding: 10px 12px;
@@ -154,14 +150,12 @@
   <div id="cam-grid"></div>
 
   <div class="right-panel">
-    <!-- 이벤트 로그 헤더 + 초기화 버튼 -->
     <div class="event-header">
       <h2>Event Log</h2>
       <button class="btn-clear" onclick="clearEventLog()">로그 초기화</button>
     </div>
     <div id="event-log"></div>
 
-    <!-- 아키텍처 다이어그램 -->
     <div id="arch-panel">
       <div class="arch-title">Network Path</div>
       <svg id="arch-svg" viewBox="0 0 315 170"
@@ -185,29 +179,25 @@
 <script>
 const WS_URL = `ws://${location.hostname}:8765`;
 
-/* ─────────────────────────────────────────────────────────────
- * 이벤트 로그 — localStorage 영속화
- * ───────────────────────────────────────────────────────────── */
+/* ---------------------------------------------------------------
+ * 이벤트 로그 (localStorage 영속화)
+ * --------------------------------------------------------------- */
 const EVENT_STORAGE_KEY = 'cctv_event_log';
 const EVENT_MAX         = 200;
 
 function loadStoredEvents() {
-  try {
-    return JSON.parse(localStorage.getItem(EVENT_STORAGE_KEY) || '[]');
-  } catch(e) { return []; }
+  try { return JSON.parse(localStorage.getItem(EVENT_STORAGE_KEY) || '[]'); }
+  catch (e) { return []; }
 }
 
 function saveStoredEvents(events) {
-  try {
-    localStorage.setItem(EVENT_STORAGE_KEY, JSON.stringify(events));
-  } catch(e) { /* 용량 초과 등 무시 */ }
+  try { localStorage.setItem(EVENT_STORAGE_KEY, JSON.stringify(events)); }
+  catch (e) {}
 }
 
-/* 새 이벤트 추가 — 저장 + DOM 렌더링 */
 function addEvent(cls, text, extra = '') {
   const timeStr = new Date().toLocaleTimeString();
-
-  const events = loadStoredEvents();
+  const events  = loadStoredEvents();
   events.unshift({ cls, text, extra, time: timeStr });
   if (events.length > EVENT_MAX) events.splice(EVENT_MAX);
   saveStoredEvents(events);
@@ -216,15 +206,12 @@ function addEvent(cls, text, extra = '') {
   const div   = document.createElement('div');
   div.className = `ev ${cls}`;
   div.innerHTML =
-    `<div>${text}${extra
-      ? ` <span class="recovery">${extra}</span>` : ''}</div>` +
+    `<div>${text}${extra ? ` <span class="recovery">${extra}</span>` : ''}</div>` +
     `<div class="time">${timeStr}</div>`;
   evLog.prepend(div);
-  if (evLog.children.length > EVENT_MAX)
-    evLog.removeChild(evLog.lastChild);
+  if (evLog.children.length > EVENT_MAX) evLog.removeChild(evLog.lastChild);
 }
 
-/* 페이지 로드 시 저장된 이벤트 복원 */
 function restoreEventLog() {
   const events = loadStoredEvents();
   const evLog  = document.getElementById('event-log');
@@ -233,22 +220,21 @@ function restoreEventLog() {
     const div = document.createElement('div');
     div.className = `ev ${e.cls}`;
     div.innerHTML =
-      `<div>${e.text}${e.extra
-        ? ` <span class="recovery">${e.extra}</span>` : ''}</div>` +
+      `<div>${e.text}${e.extra ? ` <span class="recovery">${e.extra}</span>` : ''}</div>` +
       `<div class="time">${e.time}</div>`;
     evLog.prepend(div);
   }
 }
 
-/* 로그 초기화 */
 function clearEventLog() {
   localStorage.removeItem(EVENT_STORAGE_KEY);
   document.getElementById('event-log').innerHTML = '';
 }
 
-/* ─────────────────────────────────────────────────────────────
+/* ---------------------------------------------------------------
  * 아키텍처 다이어그램
- * ───────────────────────────────────────────────────────────── */
+ * archState 값에 따라 노드 색상과 엣지 활성 여부를 갱신한다.
+ * --------------------------------------------------------------- */
 const ARCH_NODES = {
   pub1: { x: 22,  y: 42,  label: 'Pub1', kind: 'pub'    },
   pub2: { x: 22,  y: 128, label: 'Pub2', kind: 'pub'    },
@@ -271,19 +257,17 @@ const ARCH_EDGES = [
   { id: 'b4-sub',  from: 'b4',   to: 'sub', dash: true },
 ];
 
-let svgReady              = false;
-let pendingDiagramUpdate  = false;
+let svgReady             = false;
+let pendingDiagramUpdate = false;
 
 const archState = {
-  brokers:   { b1:'unknown', b2:'unknown', b3:'unknown', b4:'unknown' },
-  pubs:      { pub1:'unknown', pub2:'unknown' },
+  brokers:   { b1: 'unknown', b2: 'unknown', b3: 'unknown', b4: 'unknown' },
+  pubs:      { pub1: 'unknown', pub2: 'unknown' },
   camRoutes: {},
   subBroker: null,
 };
 
-function camToPub(camId) {
-  return camId === 'pi1' ? 'pub1' : 'pub2';
-}
+function camToPub(camId) { return camId === 'pi1' ? 'pub1' : 'pub2'; }
 
 function getActiveEdges() {
   const active = new Set();
@@ -301,7 +285,7 @@ function updateDiagram() {
   if (!svgReady) { pendingDiagramUpdate = true; return; }
 
   const activeEdges  = getActiveEdges();
-  const brokerColors = { unknown:'#3a3a3a', active:'#4caf50', inactive:'#f44336' };
+  const brokerColors = { unknown: '#3a3a3a', active: '#4caf50', inactive: '#f44336' };
 
   for (const e of ARCH_EDGES) {
     const el = document.getElementById(`edge-${e.id}`);
@@ -312,12 +296,10 @@ function updateDiagram() {
     el.setAttribute('opacity',      on ? '1' : '0.4');
     el.setAttribute('marker-end',   on ? 'url(#arrow-active)' : 'url(#arrow)');
   }
-
   for (const [b, status] of Object.entries(archState.brokers)) {
     const el = document.getElementById(`node-${b}`);
     if (el) el.setAttribute('fill', brokerColors[status] || '#3a3a3a');
   }
-
   for (const [pub, status] of Object.entries(archState.pubs)) {
     const el = document.getElementById(`node-${pub}`);
     if (!el) continue;
@@ -325,13 +307,11 @@ function updateDiagram() {
       status === 'offline' ? '#f44336' :
       status === 'online'  ? '#4caf50' : '#e67e22');
   }
-
   const subEl = document.getElementById('node-sub');
   if (subEl) {
-    const hasCam = Object.keys(archState.camRoutes).length > 0;
-    subEl.setAttribute('fill', hasCam ? '#2196f3' : '#1a4a7a');
+    subEl.setAttribute('fill',
+      Object.keys(archState.camRoutes).length > 0 ? '#2196f3' : '#1a4a7a');
   }
-
   updateRouteInfo();
 }
 
@@ -341,8 +321,7 @@ function updateRouteInfo() {
   el.innerHTML = '';
   const routes = Object.entries(archState.camRoutes);
   if (routes.length === 0) {
-    el.innerHTML =
-      '<div class="route-item"><span style="color:#333">경로 대기 중...</span></div>';
+    el.innerHTML = '<div class="route-item"><span style="color:#333">경로 대기 중...</span></div>';
     return;
   }
   for (const [cam, route] of routes) {
@@ -353,7 +332,7 @@ function updateRouteInfo() {
       `<span class="route-cam">${cam}</span>` +
       (offline
         ? `<span class="route-offline">OFFLINE</span>`
-        : `<span class="route-path">${route.from} → ${route.via} → sub</span>`);
+        : `<span class="route-path">${route.from} -> ${route.via} -> sub</span>`);
     el.appendChild(div);
   }
 }
@@ -364,62 +343,54 @@ function buildArchSVG() {
   const R = 15;
 
   for (const e of ARCH_EDGES) {
-    const fn  = ARCH_NODES[e.from], tn = ARCH_NODES[e.to];
-    const dx  = tn.x-fn.x, dy = tn.y-fn.y;
-    const len = Math.sqrt(dx*dx+dy*dy);
-    const ux  = dx/len, uy = dy/len;
-    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    const fn = ARCH_NODES[e.from], tn = ARCH_NODES[e.to];
+    const dx = tn.x - fn.x, dy = tn.y - fn.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const ux = dx / len, uy = dy / len;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
     line.setAttribute('id',           `edge-${e.id}`);
-    line.setAttribute('x1',           (fn.x+ux*R).toFixed(1));
-    line.setAttribute('y1',           (fn.y+uy*R).toFixed(1));
-    line.setAttribute('x2',           (tn.x-ux*(R+4)).toFixed(1));
-    line.setAttribute('y2',           (tn.y-uy*(R+4)).toFixed(1));
+    line.setAttribute('x1',           (fn.x + ux * R).toFixed(1));
+    line.setAttribute('y1',           (fn.y + uy * R).toFixed(1));
+    line.setAttribute('x2',           (tn.x - ux * (R + 4)).toFixed(1));
+    line.setAttribute('y2',           (tn.y - uy * (R + 4)).toFixed(1));
     line.setAttribute('stroke',       '#2a2a2a');
     line.setAttribute('stroke-width', '1');
     line.setAttribute('opacity',      '0.4');
     if (e.dash) line.setAttribute('stroke-dasharray', '4,3');
-    line.setAttribute('marker-end',   'url(#arrow)');
+    line.setAttribute('marker-end', 'url(#arrow)');
     svg.appendChild(line);
   }
 
   for (const [id, n] of Object.entries(ARCH_NODES)) {
-    const g      = document.createElementNS('http://www.w3.org/2000/svg','g');
-    const circle = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    const g      = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
     circle.setAttribute('id', `node-${id}`);
     circle.setAttribute('cx', n.x); circle.setAttribute('cy', n.y);
     circle.setAttribute('r',  R);
     circle.setAttribute('fill',
-      n.kind==='pub' ? '#e67e22' :
-      n.kind==='sub' ? '#1a4a7a' : '#3a3a3a');
-    circle.setAttribute('stroke',       '#111');
-    circle.setAttribute('stroke-width', '1.5');
+      n.kind === 'pub' ? '#e67e22' :
+      n.kind === 'sub' ? '#1a4a7a' : '#3a3a3a');
+    circle.setAttribute('stroke', '#111'); circle.setAttribute('stroke-width', '1.5');
     g.appendChild(circle);
-
-    const text = document.createElementNS('http://www.w3.org/2000/svg','text');
-    text.setAttribute('x',                  n.x);
-    text.setAttribute('y',                  n.y+1);
-    text.setAttribute('text-anchor',        'middle');
-    text.setAttribute('dominant-baseline',  'middle');
-    text.setAttribute('fill',              '#eee');
-    text.setAttribute('font-size',         '9');
-    text.setAttribute('font-weight',       '600');
-    text.setAttribute('font-family',       'monospace');
-    text.setAttribute('pointer-events',    'none');
+    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    text.setAttribute('x', n.x); text.setAttribute('y', n.y + 1);
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('dominant-baseline', 'middle');
+    text.setAttribute('fill', '#eee'); text.setAttribute('font-size', '9');
+    text.setAttribute('font-weight', '600'); text.setAttribute('font-family', 'monospace');
+    text.setAttribute('pointer-events', 'none');
     text.textContent = n.label;
     g.appendChild(text);
     svg.appendChild(g);
   }
 
   svgReady = true;
-  if (pendingDiagramUpdate) {
-    pendingDiagramUpdate = false;
-    updateDiagram();
-  }
+  if (pendingDiagramUpdate) { pendingDiagramUpdate = false; updateDiagram(); }
 }
 
-/* ─────────────────────────────────────────────────────────────
- * 카메라 셀
- * ───────────────────────────────────────────────────────────── */
+/* ---------------------------------------------------------------
+ * 카메라 셀 관리
+ * --------------------------------------------------------------- */
 const cameras      = new Map();
 const offlineTimes = {};
 const TARGET_FPS   = 15;
@@ -438,15 +409,14 @@ function updateGrid() {
   } else {
     const cols = Math.ceil(Math.sqrt(n));
     grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-    grid.style.gridTemplateRows    = `repeat(${Math.ceil(n/cols)}, 1fr)`;
+    grid.style.gridTemplateRows    = `repeat(${Math.ceil(n / cols)}, 1fr)`;
   }
 }
 
 function createCameraCell(camId) {
   const grid = document.getElementById('cam-grid');
   const cell = document.createElement('div');
-  cell.className = 'cam-cell';
-  cell.id = `cam-cell-${camId}`;
+  cell.className = 'cam-cell'; cell.id = `cam-cell-${camId}`;
   cell.innerHTML = `
     <div class="cam-label">
       <span class="dot" id="dot-${camId}"></span>
@@ -454,19 +424,18 @@ function createCameraCell(camId) {
     </div>
     <div class="cam-canvas-wrap">
       <span class="no-signal" id="nosig-${camId}">신호 없음</span>
-      <canvas class="cam-canvas" id="canvas-${camId}"
-              width="640" height="480"></canvas>
+      <canvas class="cam-canvas" id="canvas-${camId}" width="640" height="480"></canvas>
       <div class="offline-overlay" id="overlay-${camId}">
-        <div class="offline-icon">📵</div>
+        <div class="offline-icon">X</div>
         <div class="offline-text">OFFLINE</div>
         <div class="offline-time" id="overlay-time-${camId}"></div>
       </div>
     </div>
     <div class="cam-stat">
-      <span>FPS: <b id="fps-${camId}">—</b></span>
+      <span>FPS: <b id="fps-${camId}">--</b></span>
       <span>프레임: <b id="fcnt-${camId}">0</b></span>
-      <span>크기: <b id="fsz-${camId}">—</b></span>
-      <span>지연: <b id="fms-${camId}">—</b></span>
+      <span>크기: <b id="fsz-${camId}">--</b></span>
+      <span>지연: <b id="fms-${camId}">--</b></span>
     </div>`;
   grid.appendChild(cell);
 
@@ -474,8 +443,7 @@ function createCameraCell(camId) {
   const state = {
     canvas, ctx: canvas.getContext('2d'),
     pendingFrame: null, rendering: false,
-    lastRenderTime: 0, frameCount: 0, totalFrames: 0,
-    fpsTimer: Date.now(),
+    lastRenderTime: 0, frameCount: 0, totalFrames: 0, fpsTimer: Date.now(),
     elFps:         document.getElementById(`fps-${camId}`),
     elFrames:      document.getElementById(`fcnt-${camId}`),
     elSize:        document.getElementById(`fsz-${camId}`),
@@ -487,22 +455,17 @@ function createCameraCell(camId) {
   };
   cameras.set(camId, state);
 
-  /* FPS 카운터 */
   setInterval(() => {
     const elapsed = (Date.now() - state.fpsTimer) / 1000;
-    state.elFps.textContent =
-      elapsed > 0 ? (state.frameCount / elapsed).toFixed(1) : '—';
-    state.frameCount = 0;
-    state.fpsTimer   = Date.now();
+    state.elFps.textContent = elapsed > 0 ? (state.frameCount / elapsed).toFixed(1) : '--';
+    state.frameCount = 0; state.fpsTimer = Date.now();
   }, 1000);
 
-  /* 오프라인 경과 시간 카운터 */
   setInterval(() => {
     if (!offlineTimes[camId]) return;
     const sec = Math.floor((Date.now() - offlineTimes[camId]) / 1000);
-    const m   = Math.floor(sec/60), s = sec%60;
-    state.elOverlayTime.textContent =
-      `오프라인 ${m>0 ? m+'분 ' : ''}${s}초`;
+    const m = Math.floor(sec / 60), s = sec % 60;
+    state.elOverlayTime.textContent = `오프라인 ${m > 0 ? m + '분 ' : ''}${s}초`;
   }, 1000);
 
   updateGrid();
@@ -513,34 +476,30 @@ function getOrCreateCamera(camId) {
   return cameras.has(camId) ? cameras.get(camId) : createCameraCell(camId);
 }
 
-/* ─────────────────────────────────────────────────────────────
+/* ---------------------------------------------------------------
  * 프레임 렌더링
- * ───────────────────────────────────────────────────────────── */
+ * createImageBitmap으로 비동기 디코딩하며, 처리 중일 때는
+ * 최신 프레임 한 장만 대기시켜 지연 누적을 방지한다.
+ * --------------------------------------------------------------- */
 async function renderFrame(state, arrayBuffer) {
   const t0 = performance.now();
   try {
     const blob   = new Blob([arrayBuffer], { type: 'image/jpeg' });
     const bitmap = await createImageBitmap(blob);
-    if (state.canvas.width  !== bitmap.width ||
-        state.canvas.height !== bitmap.height) {
-      state.canvas.width  = bitmap.width;
-      state.canvas.height = bitmap.height;
+    if (state.canvas.width !== bitmap.width || state.canvas.height !== bitmap.height) {
+      state.canvas.width = bitmap.width; state.canvas.height = bitmap.height;
     }
-    state.ctx.drawImage(bitmap, 0, 0);
-    bitmap.close();
-    state.elNoSig.style.display = 'none';
-    state.canvas.style.display  = 'block';
-    state.frameCount++;
-    state.totalFrames++;
+    state.ctx.drawImage(bitmap, 0, 0); bitmap.close();
+    state.elNoSig.style.display = 'none'; state.canvas.style.display = 'block';
+    state.frameCount++; state.totalFrames++;
     state.elFrames.textContent = state.totalFrames;
-    state.elSize.textContent   = (arrayBuffer.byteLength/1024).toFixed(1)+' KB';
-    state.elMs.textContent     = (performance.now()-t0).toFixed(1)+' ms';
-  } catch(e) {
+    state.elSize.textContent   = (arrayBuffer.byteLength / 1024).toFixed(1) + ' KB';
+    state.elMs.textContent     = (performance.now() - t0).toFixed(1) + ' ms';
+  } catch (e) {
     console.warn('Frame decode error:', e);
   } finally {
     if (state.pendingFrame) {
-      const next = state.pendingFrame;
-      state.pendingFrame = null;
+      const next = state.pendingFrame; state.pendingFrame = null;
       renderFrame(state, next);
     } else {
       state.rendering = false;
@@ -551,18 +510,13 @@ async function renderFrame(state, arrayBuffer) {
 function onFrame(camId, arrayBuffer) {
   const state = getOrCreateCamera(camId);
   const now   = performance.now();
-  if (now - state.lastRenderTime < FRAME_MS) {
-    state.pendingFrame = arrayBuffer; return;
-  }
+  if (now - state.lastRenderTime < FRAME_MS) { state.pendingFrame = arrayBuffer; return; }
   state.lastRenderTime = now;
-  if (!state.rendering) {
-    state.rendering = true;
-    renderFrame(state, arrayBuffer);
-  } else {
-    state.pendingFrame = arrayBuffer;
-  }
+  if (!state.rendering) { state.rendering = true; renderFrame(state, arrayBuffer); }
+  else { state.pendingFrame = arrayBuffer; }
 }
 
+/* 바이너리 프레임 포맷: [1B: id_len][cam_id][JPEG] */
 function parseBinaryFrame(arrayBuffer) {
   const view  = new Uint8Array(arrayBuffer);
   const idLen = view[0];
@@ -571,12 +525,12 @@ function parseBinaryFrame(arrayBuffer) {
   return { camId, jpeg };
 }
 
-/* ─────────────────────────────────────────────────────────────
- * WS 메시지 처리
- * ───────────────────────────────────────────────────────────── */
+/* ---------------------------------------------------------------
+ * WebSocket 메시지 처리
+ * --------------------------------------------------------------- */
 function handleTextMessage(json) {
   let msg;
-  try { msg = JSON.parse(json); } catch(e) { return; }
+  try { msg = JSON.parse(json); } catch (e) { return; }
 
   const cam  = msg.cam  || '?';
   const type = msg.type || '';
@@ -584,34 +538,26 @@ function handleTextMessage(json) {
   const from = msg.from || '';
   const via  = msg.via  || '';
 
-  /* ── 라우팅 경로 ── */
   if (type === 'route') {
-    const prev     = archState.camRoutes[cam];
-    const prevPath = prev ? `${prev.from}→${prev.via}` : null;
-    const newPath  = `${from}→${via}`;
-
+    const prev    = archState.camRoutes[cam];
+    const prevStr = prev ? `${prev.from}->${prev.via}` : null;
+    const newStr  = `${from}->${via}`;
     getOrCreateCamera(cam);
     archState.camRoutes[cam] = { from, via };
     archState.brokers[from]  = 'active';
     archState.brokers[via]   = 'active';
-
     const pub = camToPub(cam);
     if (archState.pubs[pub] !== 'online') {
       archState.pubs[pub] = 'online';
       const cs = cameras.get(cam);
-      if (cs) {
-        cs.elOverlay.classList.remove('show');
-        cs.elDot.className = 'dot live';
-      }
+      if (cs) { cs.elOverlay.classList.remove('show'); cs.elDot.className = 'dot live'; }
     }
-
     updateDiagram();
-    if (prevPath && prevPath !== newPath)
-      addEvent('route', `[${cam}] 경로 변경: ${prevPath} → ${newPath}`);
+    if (prevStr && prevStr !== newStr)
+      addEvent('route', `[${cam}] 경로 변경: ${prevStr} -> ${newStr}`);
     return;
   }
 
-  /* ── 브로커 상태 ── */
   if (type === 'broker_status') {
     archState.brokers[msg.broker] = msg.active ? 'active' : 'inactive';
     updateDiagram();
@@ -620,7 +566,6 @@ function handleTextMessage(json) {
     return;
   }
 
-  /* ── Sub 연결 브로커 ── */
   if (type === 'sub_connected') {
     archState.subBroker = msg.broker.toLowerCase();
     archState.brokers[archState.subBroker] = 'active';
@@ -628,22 +573,19 @@ function handleTextMessage(json) {
     return;
   }
 
-  /* ── 카메라 이벤트 ── */
   if (type === 'event') {
     getOrCreateCamera(cam);
     const name    = (typeof data === 'object' && data.event) ? data.event : '이벤트';
-    const pathStr = (from && via) ? ` (${from}→${via})` : '';
+    const pathStr = (from && via) ? ` (${from}->${via})` : '';
     addEvent('motion', `[${cam}] ${name} 감지${pathStr}`);
     return;
   }
 
-  /* ── 카메라 상태 ── */
   if (type === 'status') {
-    const cs  = getOrCreateCamera(cam);
-    const pub = camToPub(cam);
+    const cs   = getOrCreateCamera(cam);
+    const pub  = camToPub(cam);
     const online = (data === 'online' ||
                    (typeof data === 'object' && data.status === 'online'));
-
     if (online) {
       let recoveryStr = '';
       if (offlineTimes[cam]) {
@@ -670,15 +612,16 @@ function handleTextMessage(json) {
   }
 }
 
-/* ─────────────────────────────────────────────────────────────
- * WebSocket
- * ───────────────────────────────────────────────────────────── */
+/* ---------------------------------------------------------------
+ * WebSocket 연결 관리
+ * 끊기면 3초 후 자동 재연결. 연결 직후 request_state로
+ * subscriber_ws가 보유한 현재 상태를 동기화한다.
+ * --------------------------------------------------------------- */
 const wsBadge = document.getElementById('ws-badge');
 let wsRef = null;
 
 function requestState() {
-  if (wsRef && wsRef.readyState === WebSocket.OPEN)
-    wsRef.send('request_state');
+  if (wsRef && wsRef.readyState === WebSocket.OPEN) wsRef.send('request_state');
 }
 
 function connect() {
@@ -687,37 +630,25 @@ function connect() {
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
-    wsBadge.textContent = 'WS 연결됨';
-    wsBadge.className   = 'badge live';
-    setTimeout(requestState, 500);
-    setTimeout(requestState, 1500);
+    wsBadge.textContent = 'WS 연결됨'; wsBadge.className = 'badge live';
+    setTimeout(requestState, 500); setTimeout(requestState, 1500);
   };
-
   ws.onmessage = ({ data }) => {
     if (data instanceof ArrayBuffer) {
-      const { camId, jpeg } = parseBinaryFrame(data);
-      onFrame(camId, jpeg);
+      const { camId, jpeg } = parseBinaryFrame(data); onFrame(camId, jpeg);
     } else {
       handleTextMessage(data);
     }
   };
-
   ws.onclose = () => {
-    wsBadge.textContent = 'WS 끊김 — 재연결 중...';
-    wsBadge.className   = 'badge err';
-    wsRef = null;
-    setTimeout(connect, 3000);
+    wsBadge.textContent = 'WS 끊김 -- 재연결 중...'; wsBadge.className = 'badge err';
+    wsRef = null; setTimeout(connect, 3000);
   };
-
   ws.onerror = () => ws.close();
 }
 
-/* 안전망: 3초마다 다이어그램 강제 갱신 */
 setInterval(updateDiagram, 3000);
 
-/* ─────────────────────────────────────────────────────────────
- * 초기화
- * ───────────────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   restoreEventLog();
   buildArchSVG();

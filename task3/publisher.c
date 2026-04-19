@@ -33,8 +33,8 @@ typedef struct {
 static const broker_t BROKERS[] = {
     { "192.168.0.7",  1883, "B1" },
     { "192.168.0.11", 1883, "B2" },
-    { "192.168.0.13", 1883, "B3" },
-    { "192.168.0.9",  1883, "B4" },
+    // { "192.168.0.29", 1883, "B3" },
+    // { "192.168.0.8",  1883, "B4" },
 };
 #define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
 

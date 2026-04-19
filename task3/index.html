@@ -34,8 +34,7 @@
     /* ── 카메라 그리드 ── */
     #cam-grid {
       flex: 1; display: grid;
-      gap: 2px; background: #222;
-      overflow: hidden;
+      gap: 2px; background: #222; overflow: hidden;
     }
     .cam-cell {
       background: #111; display: flex;
@@ -48,19 +47,42 @@
       padding: 2px 7px; border-radius: 4px;
       display: flex; align-items: center; gap: 6px;
     }
-    .cam-label .dot { width: 6px; height: 6px; border-radius: 50%; background: #555; }
+    .cam-label .dot {
+      width: 6px; height: 6px; border-radius: 50%; background: #555;
+    }
     .cam-label .dot.live { background: #4caf50; }
     .cam-label .dot.err  { background: #f44336; }
+
     .cam-canvas-wrap {
       flex: 1; display: flex;
       align-items: center; justify-content: center; position: relative;
     }
-    /* ── 카메라 180도 회전 ── */
     .cam-canvas {
       max-width: 100%; max-height: 100%; display: block;
       transform: rotate(180deg);
     }
-    .no-signal  { position: absolute; color: #444; font-size: 0.82rem; }
+    .no-signal { position: absolute; color: #444; font-size: 0.82rem; }
+
+    /* ── 오프라인 오버레이 ── */
+    .offline-overlay {
+      position: absolute; inset: 0; z-index: 5;
+      background: rgba(0,0,0,0.72);
+      display: none;
+      flex-direction: column;
+      align-items: center; justify-content: center; gap: 10px;
+    }
+    .offline-overlay.show { display: flex; }
+    .offline-icon {
+      font-size: 2.2rem; line-height: 1;
+    }
+    .offline-text {
+      font-size: 0.85rem; color: #f44336;
+      font-weight: 600; letter-spacing: 1px;
+    }
+    .offline-time {
+      font-size: 0.68rem; color: #666;
+    }
+
     .cam-stat {
       padding: 3px 8px; background: #0e0e0e;
       border-top: 1px solid #1e1e1e;
@@ -69,28 +91,24 @@
     }
     .cam-stat b { color: #777; }
 
-    /* ── 우측 패널: 이벤트 로그 + 아키텍처 ── */
+    /* ── 우측 패널 ── */
     .right-panel {
       width: 340px; background: #111;
       display: flex; flex-direction: column;
       border-left: 1px solid #2a2a2a; flex-shrink: 0;
     }
-
-    /* ── 이벤트 로그 (상단, 스크롤) ── */
     .event-header {
       font-size: 0.75rem; font-weight: 500; color: #666;
       padding: 8px 12px; border-bottom: 1px solid #1e1e1e;
-      text-transform: uppercase; letter-spacing: 0.5px;
-      flex-shrink: 0;
+      text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0;
     }
-    #event-log {
-      flex: 1; overflow-y: auto; padding: 4px 0; min-height: 0;
-    }
+    #event-log { flex: 1; overflow-y: auto; padding: 4px 0; min-height: 0; }
     .ev {
       padding: 6px 12px; border-bottom: 1px solid #1a1a1a;
       font-size: 0.75rem; line-height: 1.4;
     }
     .ev .time { color: #444; font-size: 0.68rem; margin-top: 1px; }
+    .ev .recovery { color: #4caf50; font-size: 0.68rem; font-weight: 600; }
     .ev.motion  { border-left: 2px solid #ff9800; }
     .ev.offline { border-left: 2px solid #f44336; }
     .ev.online  { border-left: 2px solid #4caf50; }
@@ -98,29 +116,25 @@
     #event-log::-webkit-scrollbar { width: 3px; }
     #event-log::-webkit-scrollbar-thumb { background: #333; }
 
-    /* ── 아키텍처 다이어그램 (하단 고정) ── */
+    /* ── 아키텍처 다이어그램 ── */
     #arch-panel {
-      flex-shrink: 0;
-      background: #0d0d0d;
-      border-top: 1px solid #2a2a2a;
-      padding: 10px 12px;
+      flex-shrink: 0; background: #0d0d0d;
+      border-top: 1px solid #2a2a2a; padding: 10px 12px;
     }
     .arch-title {
       font-size: 0.63rem; color: #444;
-      text-transform: uppercase; letter-spacing: 0.8px;
-      margin-bottom: 8px;
+      text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px;
     }
     #arch-svg { display: block; margin: 0 auto; }
     #route-info {
-      margin-top: 8px; display: flex;
-      flex-direction: column; gap: 3px;
+      margin-top: 8px; display: flex; flex-direction: column; gap: 3px;
     }
     .route-item {
-      display: flex; align-items: center; gap: 6px;
-      font-size: 0.68rem; color: #555;
+      display: flex; align-items: center; gap: 6px; font-size: 0.68rem;
     }
     .route-cam  { color: #888; min-width: 28px; }
     .route-path { color: #4caf50; font-family: monospace; }
+    .route-offline { color: #f44336; font-family: monospace; }
   </style>
 </head>
 <body>
@@ -131,22 +145,16 @@
 </header>
 
 <div class="main">
-  <!-- 카메라 그리드 -->
   <div id="cam-grid"></div>
 
-  <!-- 우측 패널 -->
   <div class="right-panel">
-    <!-- 이벤트 로그 (상단) -->
     <div class="event-header">Event Log</div>
     <div id="event-log"></div>
 
-    <!-- 아키텍처 다이어그램 (하단) -->
     <div id="arch-panel">
       <div class="arch-title">Network Path</div>
-      <svg id="arch-svg"
-           viewBox="0 0 315 170"
-           width="315" height="170"
-           xmlns="http://www.w3.org/2000/svg">
+      <svg id="arch-svg" viewBox="0 0 315 170"
+           width="315" height="170" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrow" markerWidth="6" markerHeight="6"
                   refX="5" refY="3" orient="auto">
@@ -170,13 +178,13 @@ const WS_URL = `ws://${location.hostname}:8765`;
  * 아키텍처 다이어그램
  * ───────────────────────────────────────────────────────────── */
 const ARCH_NODES = {
-  pub1: { x: 22,  y: 42,  label: 'Pub1', kind: 'pub'    },
-  pub2: { x: 22,  y: 128, label: 'Pub2', kind: 'pub'    },
+  pub1: { x: 22,  y: 42,  label: 'Pub1', kind: 'pub' },
+  pub2: { x: 22,  y: 128, label: 'Pub2', kind: 'pub' },
   b1:   { x: 105, y: 42,  label: 'B1',   kind: 'broker' },
   b2:   { x: 105, y: 128, label: 'B2',   kind: 'broker' },
   b3:   { x: 210, y: 42,  label: 'B3',   kind: 'broker' },
   b4:   { x: 210, y: 128, label: 'B4',   kind: 'broker' },
-  sub:  { x: 292, y: 85,  label: 'Sub',  kind: 'sub'    },
+  sub:  { x: 292, y: 85,  label: 'Sub',  kind: 'sub' },
 };
 
 const ARCH_EDGES = [
@@ -192,18 +200,14 @@ const ARCH_EDGES = [
   { id: 'b4-sub',  from: 'b4',   to: 'sub', dash: true },
 ];
 
-const NODE_COLORS = {
-  pub: '#e67e22',
-  sub: '#1a4a7a',
-  broker: { unknown: '#3a3a3a', active: '#4caf50', inactive: '#f44336' }
-};
-
 const archState = {
-  brokers:   { b1:'unknown', b2:'unknown', b3:'unknown', b4:'unknown' },
+  brokers: { b1:'unknown', b2:'unknown', b3:'unknown', b4:'unknown' },
+  pubs:    { pub1:'unknown', pub2:'unknown' },  /* pub 상태 */
   camRoutes: {},
   subBroker: null,
 };
 
+/* cam → pub 매핑 */
 function camToPub(camId) {
   return camId === 'pi1' ? 'pub1' : 'pub2';
 }
@@ -211,6 +215,8 @@ function camToPub(camId) {
 function getActiveEdges() {
   const active = new Set();
   for (const [cam, route] of Object.entries(archState.camRoutes)) {
+    /* pub가 오프라인이면 경로 활성화 안 함 */
+    if (archState.pubs[camToPub(cam)] === 'offline') continue;
     const pub = camToPub(cam);
     active.add(`${pub}-${route.from}`);
     active.add(`${route.from}-${route.via}`);
@@ -222,6 +228,7 @@ function getActiveEdges() {
 function updateDiagram() {
   const activeEdges = getActiveEdges();
 
+  /* 엣지 */
   for (const e of ARCH_EDGES) {
     const el = document.getElementById(`edge-${e.id}`);
     if (!el) continue;
@@ -232,14 +239,26 @@ function updateDiagram() {
     el.setAttribute('marker-end', on ? 'url(#arrow-active)' : 'url(#arrow)');
   }
 
-  for (const [broker, status] of Object.entries(archState.brokers)) {
-    const el = document.getElementById(`node-${broker}`);
-    if (el) el.setAttribute('fill', NODE_COLORS.broker[status]);
+  /* 브로커 노드 */
+  const brokerColors = { unknown:'#3a3a3a', active:'#4caf50', inactive:'#f44336' };
+  for (const [b, status] of Object.entries(archState.brokers)) {
+    const el = document.getElementById(`node-${b}`);
+    if (el) el.setAttribute('fill', brokerColors[status] || '#3a3a3a');
   }
 
+  /* pub 노드 */
+  for (const [pub, status] of Object.entries(archState.pubs)) {
+    const el = document.getElementById(`node-${pub}`);
+    if (!el) continue;
+    if (status === 'offline')        el.setAttribute('fill', '#f44336');
+    else if (status === 'online')    el.setAttribute('fill', '#4caf50');
+    else                             el.setAttribute('fill', '#e67e22');
+  }
+
+  /* sub 노드 */
   const subEl = document.getElementById('node-sub');
   if (subEl) {
-    const hasCam = Object.keys(archState.camRoutes).length > 0;
+    const hasCam = Object.values(archState.camRoutes).length > 0;
     subEl.setAttribute('fill', hasCam ? '#2196f3' : '#1a4a7a');
   }
 
@@ -251,15 +270,19 @@ function updateRouteInfo() {
   el.innerHTML = '';
   const routes = Object.entries(archState.camRoutes);
   if (routes.length === 0) {
-    el.innerHTML = '<div class="route-item"><span style="color:#333">경로 대기 중...</span></div>';
+    el.innerHTML =
+      '<div class="route-item"><span style="color:#333">경로 대기 중...</span></div>';
     return;
   }
   for (const [cam, route] of routes) {
-    const div = document.createElement('div');
+    const div  = document.createElement('div');
     div.className = 'route-item';
+    const isOffline = archState.pubs[camToPub(cam)] === 'offline';
     div.innerHTML =
       `<span class="route-cam">${cam}</span>` +
-      `<span class="route-path">${route.from} → ${route.via} → sub</span>`;
+      (isOffline
+        ? `<span class="route-offline">OFFLINE</span>`
+        : `<span class="route-path">${route.from} → ${route.via} → sub</span>`);
     el.appendChild(div);
   }
 }
@@ -269,55 +292,46 @@ function buildArchSVG() {
   const R = 15;
 
   for (const e of ARCH_EDGES) {
-    const fn = ARCH_NODES[e.from];
-    const tn = ARCH_NODES[e.to];
-    const dx = tn.x - fn.x, dy = tn.y - fn.y;
-    const len = Math.sqrt(dx*dx + dy*dy);
+    const fn = ARCH_NODES[e.from], tn = ARCH_NODES[e.to];
+    const dx = tn.x-fn.x, dy = tn.y-fn.y;
+    const len = Math.sqrt(dx*dx+dy*dy);
     const ux = dx/len, uy = dy/len;
-
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
     line.setAttribute('id', `edge-${e.id}`);
-    line.setAttribute('x1', (fn.x + ux*R).toFixed(1));
-    line.setAttribute('y1', (fn.y + uy*R).toFixed(1));
-    line.setAttribute('x2', (tn.x - ux*(R+4)).toFixed(1));
-    line.setAttribute('y2', (tn.y - uy*(R+4)).toFixed(1));
-    line.setAttribute('stroke', '#2a2a2a');
-    line.setAttribute('stroke-width', '1');
-    line.setAttribute('opacity', '0.4');
-    if (e.dash) line.setAttribute('stroke-dasharray', '4,3');
-    line.setAttribute('marker-end', 'url(#arrow)');
+    line.setAttribute('x1', (fn.x+ux*R).toFixed(1));
+    line.setAttribute('y1', (fn.y+uy*R).toFixed(1));
+    line.setAttribute('x2', (tn.x-ux*(R+4)).toFixed(1));
+    line.setAttribute('y2', (tn.y-uy*(R+4)).toFixed(1));
+    line.setAttribute('stroke','#2a2a2a');
+    line.setAttribute('stroke-width','1');
+    line.setAttribute('opacity','0.4');
+    if (e.dash) line.setAttribute('stroke-dasharray','4,3');
+    line.setAttribute('marker-end','url(#arrow)');
     svg.appendChild(line);
   }
 
   for (const [id, n] of Object.entries(ARCH_NODES)) {
-    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-
-    const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    const circle = document.createElementNS('http://www.w3.org/2000/svg','circle');
     circle.setAttribute('id', `node-${id}`);
-    circle.setAttribute('cx', n.x);
-    circle.setAttribute('cy', n.y);
+    circle.setAttribute('cx', n.x); circle.setAttribute('cy', n.y);
     circle.setAttribute('r', R);
     circle.setAttribute('fill',
-      n.kind === 'pub' ? NODE_COLORS.pub :
-      n.kind === 'sub' ? NODE_COLORS.sub :
-      NODE_COLORS.broker.unknown);
-    circle.setAttribute('stroke', '#111');
-    circle.setAttribute('stroke-width', '1.5');
+      n.kind==='pub' ? '#e67e22' :
+      n.kind==='sub' ? '#1a4a7a' : '#3a3a3a');
+    circle.setAttribute('stroke','#111');
+    circle.setAttribute('stroke-width','1.5');
     g.appendChild(circle);
-
-    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttribute('x', n.x);
-    text.setAttribute('y', n.y + 1);
-    text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('dominant-baseline', 'middle');
-    text.setAttribute('fill', '#eee');
-    text.setAttribute('font-size', '9');
-    text.setAttribute('font-weight', '600');
-    text.setAttribute('font-family', 'monospace');
-    text.setAttribute('pointer-events', 'none');
+    const text = document.createElementNS('http://www.w3.org/2000/svg','text');
+    text.setAttribute('x', n.x); text.setAttribute('y', n.y+1);
+    text.setAttribute('text-anchor','middle');
+    text.setAttribute('dominant-baseline','middle');
+    text.setAttribute('fill','#eee'); text.setAttribute('font-size','9');
+    text.setAttribute('font-weight','600');
+    text.setAttribute('font-family','monospace');
+    text.setAttribute('pointer-events','none');
     text.textContent = n.label;
     g.appendChild(text);
-
     svg.appendChild(g);
   }
 }
@@ -325,7 +339,8 @@ function buildArchSVG() {
 /* ─────────────────────────────────────────────────────────────
  * 카메라 셀
  * ───────────────────────────────────────────────────────────── */
-const cameras = new Map();
+const cameras   = new Map();
+const offlineTimes = {};   /* cam → offline 시작 시각 */
 const TARGET_FPS = 15;
 const FRAME_MS   = 1000 / TARGET_FPS;
 
@@ -360,6 +375,12 @@ function createCameraCell(camId) {
       <span class="no-signal" id="nosig-${camId}">신호 없음</span>
       <canvas class="cam-canvas" id="canvas-${camId}"
               width="640" height="480"></canvas>
+      <!-- 오프라인 오버레이 -->
+      <div class="offline-overlay" id="overlay-${camId}">
+        <div class="offline-icon">📵</div>
+        <div class="offline-text">OFFLINE</div>
+        <div class="offline-time" id="overlay-time-${camId}"></div>
+      </div>
     </div>
     <div class="cam-stat">
       <span>FPS: <b id="fps-${camId}">—</b></span>
@@ -381,15 +402,29 @@ function createCameraCell(camId) {
     elMs:     document.getElementById(`fms-${camId}`),
     elDot:    document.getElementById(`dot-${camId}`),
     elNoSig:  document.getElementById(`nosig-${camId}`),
+    elOverlay: document.getElementById(`overlay-${camId}`),
+    elOverlayTime: document.getElementById(`overlay-time-${camId}`),
   };
   cameras.set(camId, state);
 
+  /* FPS 카운터 */
   setInterval(() => {
     const elapsed = (Date.now() - state.fpsTimer) / 1000;
-    state.elFps.textContent = elapsed > 0 ?
-      (state.frameCount / elapsed).toFixed(1) : '—';
+    state.elFps.textContent =
+      elapsed > 0 ? (state.frameCount / elapsed).toFixed(1) : '—';
     state.frameCount = 0;
     state.fpsTimer   = Date.now();
+  }, 1000);
+
+  /* 오프라인 시간 카운터 */
+  setInterval(() => {
+    if (offlineTimes[camId] && state.elOverlayTime) {
+      const sec = Math.floor((Date.now() - offlineTimes[camId]) / 1000);
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      state.elOverlayTime.textContent =
+        `오프라인 ${m > 0 ? m+'분 ' : ''}${s}초`;
+    }
   }, 1000);
 
   updateGrid();
@@ -461,12 +496,14 @@ function parseBinaryFrame(arrayBuffer) {
 /* ─────────────────────────────────────────────────────────────
  * 이벤트 로그
  * ───────────────────────────────────────────────────────────── */
-function addEvent(cls, text) {
+function addEvent(cls, text, extra = '') {
   const evLog = document.getElementById('event-log');
   const now   = new Date().toLocaleTimeString();
   const div   = document.createElement('div');
   div.className = `ev ${cls}`;
-  div.innerHTML = `<div>${text}</div><div class="time">${now}</div>`;
+  div.innerHTML =
+    `<div>${text}${extra ? ` <span class="recovery">${extra}</span>` : ''}</div>` +
+    `<div class="time">${now}</div>`;
   evLog.prepend(div);
   if (evLog.children.length > 100) evLog.removeChild(evLog.lastChild);
 }
@@ -484,18 +521,23 @@ function handleTextMessage(json) {
   const from = msg.from || '';
   const via  = msg.via  || '';
 
+  /* ── 라우팅 경로 변경 ── */
   if (type === 'route') {
-    const prev = archState.camRoutes[cam];
+    const prev     = archState.camRoutes[cam];
     const prevPath = prev ? `${prev.from}→${prev.via}` : null;
+    const newPath  = `${msg.from}→${msg.via}`;
+
     archState.camRoutes[cam] = { from: msg.from, via: msg.via };
     archState.brokers[msg.from] = 'active';
     archState.brokers[msg.via]  = 'active';
     updateDiagram();
-    if (prevPath && prevPath !== `${msg.from}→${msg.via}`)
-      addEvent('route', `[${cam}] 경로 변경: ${prevPath} → ${msg.from}→${msg.via}`);
+
+    if (prevPath && prevPath !== newPath)
+      addEvent('route', `[${cam}] 경로 변경: ${prevPath} → ${newPath}`);
     return;
   }
 
+  /* ── 브로커 상태 ── */
   if (type === 'broker_status') {
     archState.brokers[msg.broker] = msg.active ? 'active' : 'inactive';
     updateDiagram();
@@ -504,6 +546,7 @@ function handleTextMessage(json) {
     return;
   }
 
+  /* ── Sub 연결 브로커 ── */
   if (type === 'sub_connected') {
     archState.subBroker = msg.broker.toLowerCase();
     archState.brokers[archState.subBroker] = 'active';
@@ -511,25 +554,60 @@ function handleTextMessage(json) {
     return;
   }
 
+  /* ── 카메라 이벤트 ── */
   if (type === 'event') {
     getOrCreateCamera(cam);
-    const name = (typeof data === 'object' && data.event) ? data.event : '이벤트';
+    const name    = (typeof data === 'object' && data.event) ? data.event : '이벤트';
     const pathStr = (from && via) ? ` (${from}→${via})` : '';
     addEvent('motion', `[${cam}] ${name} 감지${pathStr}`);
+    return;
+  }
 
-  } else if (type === 'status') {
-    getOrCreateCamera(cam);
-    const state  = cameras.get(cam);
+  /* ── 카메라 상태 ── */
+  if (type === 'status') {
+    const state  = getOrCreateCamera(cam);
+    const pub    = camToPub(cam);
     const online = (data === 'online' ||
                    (typeof data === 'object' && data.status === 'online'));
+
     if (online) {
-      addEvent('online',  `[${cam}] 온라인`);
-      if (state) state.elDot.className = 'dot live';
-    } else {
-      addEvent('offline', `[${cam}] 오프라인`);
-      if (state) state.elDot.className = 'dot err';
+      /* ── 복구 ── */
+      let recoveryStr = '';
+      if (offlineTimes[cam]) {
+        const sec = ((Date.now() - offlineTimes[cam]) / 1000).toFixed(1);
+        recoveryStr = `(복구 ${sec}초)`;
+        delete offlineTimes[cam];
+      }
+
+      /* 오버레이 숨김 */
+      state.elOverlay.classList.remove('show');
+      state.elOverlayTime.textContent = '';
+      state.elDot.className = 'dot live';
+
+      /* pub 노드 온라인 */
+      archState.pubs[pub] = 'online';
+
+      /* 라우트 초기화 → 새 route 메시지 기다림 */
       delete archState.camRoutes[cam];
+
       updateDiagram();
+      addEvent('online', `[${cam}] 온라인`, recoveryStr);
+
+    } else {
+      /* ── 오프라인 ── */
+      offlineTimes[cam] = Date.now();
+
+      /* 오버레이 표시 */
+      state.elOverlay.classList.add('show');
+      state.elOverlayTime.textContent = '오프라인 0초';
+      state.elDot.className = 'dot err';
+
+      /* pub 노드 오프라인 + 라우트 초기화 */
+      archState.pubs[pub] = 'offline';
+      delete archState.camRoutes[cam];
+
+      updateDiagram();
+      addEvent('offline', `[${cam}] 오프라인`);
     }
   }
 }

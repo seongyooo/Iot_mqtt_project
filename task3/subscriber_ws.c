@@ -20,11 +20,17 @@ typedef struct {
     const char *label;
 } broker_t;
 
+// static const broker_t BROKERS[] = {
+//     { "192.168.0.13", 1883, "B3" },
+//     { "192.168.0.9",  1883, "B4" },
+//     { "192.168.0.7",  1883, "B1" },
+//     { "192.168.0.11", 1883, "B2" },
+// };
 static const broker_t BROKERS[] = {
-    { "192.168.0.13", 1883, "B3" },
-    { "192.168.0.9",  1883, "B4" },
-    { "192.168.0.7",  1883, "B1" },
-    { "192.168.0.11", 1883, "B2" },
+    { "192.168.0.29", 1883, "B3" },
+    { "192.168.0.8",  1883, "B4" }
+    // { "192.168.0.7",  1883, "B1" },
+    // { "192.168.0.11", 1883, "B2" },
 };
 #define BROKER_COUNT (int)(sizeof(BROKERS)/sizeof(BROKERS[0]))
 
@@ -93,7 +99,24 @@ static void on_message(struct mosquitto *mosq, void *ud,
         return;
     }
 
-    printf("[MSG] %s\n", (char *)msg->payload);
+    printf("[MSG] %.*s\n", (int)msg->payloadlen, (char *)msg->payload);
+}
+
+/* ── WebSocket Callbacks ───── */
+
+static void on_ws_open(ws_cli_conn_t c) {
+    (void)c;
+    printf("[WS] client connected\n");
+}
+
+static void on_ws_close(ws_cli_conn_t c) {
+    (void)c;
+    printf("[WS] client disconnected\n");
+}
+
+static void on_ws_msg(ws_cli_conn_t c,
+                      const unsigned char *msg, uint64_t sz, int type) {
+    (void)c; (void)msg; (void)sz; (void)type;
 }
 
 /* ── Callback setup ─────────── */
@@ -129,7 +152,7 @@ static void do_failover(void) {
     g_connect_start = time(NULL);
     g_loop_count = 0;
 
-    int rc = mosquitto_connect_async(
+    int rc = mosquitto_connect(
         g_mosq,
         BROKERS[g_broker_idx].host,
         BROKERS[g_broker_idx].port,
@@ -150,7 +173,13 @@ int main(void) {
     ws_socket(&(struct ws_server){
         .host = "0.0.0.0",
         .port = WS_PORT,
-        .thread_loop = 1
+        .thread_loop = 1,
+        .timeout_ms = 1000,
+        .evs = {
+            .onopen    = on_ws_open,
+            .onclose   = on_ws_close,
+            .onmessage = on_ws_msg,
+        }
     });
 
     printf("[WS] Started on %d\n", WS_PORT);

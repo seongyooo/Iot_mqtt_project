@@ -293,3 +293,6 @@ task3/subscriber_ws
 wsServer/
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,visualstudiocode,c,python,database,cmake
+
+.claude/
+.DS_Store

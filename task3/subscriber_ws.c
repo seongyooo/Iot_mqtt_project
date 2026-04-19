@@ -322,6 +322,10 @@ static void do_failover(void) {
     setup_callbacks(g_mosq);
     g_need_failover = 0;
     g_connect_start = time(NULL);
+
+    /* loop_start 를 connect_async 보다 먼저 호출 (macOS 2.1.2 퀴크) */
+    mosquitto_loop_start(g_mosq);
+
     int rc = mosquitto_connect_async(g_mosq,
                                      BROKERS[g_broker_idx].host,
                                      BROKERS[g_broker_idx].port, 10);
@@ -329,7 +333,6 @@ static void do_failover(void) {
         fprintf(stderr, "[Failover] connect_async failed rc=%d\n", rc);
         g_connect_start = 0; g_need_failover = 1; return;
     }
-    mosquitto_loop_start(g_mosq);
 }
 
 static struct mosquitto *mqtt_init(void) {
@@ -337,6 +340,11 @@ static struct mosquitto *mqtt_init(void) {
     struct mosquitto *mosq = mosquitto_new("cctv_sub_edge_c", true, NULL);
     if (!mosq) { perror("mosquitto_new"); return NULL; }
     setup_callbacks(mosq);
+
+    /* macOS libmosquitto 2.1.2 퀴크: loop_start 를 connect_async 이전에
+     * 호출해야 rc=14 (ENOTCONN) 가짜 에러를 피할 수 있음 */
+    mosquitto_loop_start(mosq);
+
     for (int i = 0; i < BROKER_COUNT; i++) {
         int rc = mosquitto_connect_async(mosq,
                                          BROKERS[i].host, BROKERS[i].port, 10);
@@ -347,7 +355,6 @@ static struct mosquitto *mqtt_init(void) {
             break;
         }
     }
-    mosquitto_loop_start(mosq);
     return mosq;
 }
 

@@ -75,7 +75,7 @@ static const broker_t BROKERS[] = {
  * MOTION_CONFIRM_FRAMES 프레임 연속되면 모션 이벤트를 발행한다.
  * ----------------------------------------------------------------- */
 #define MOTION_RATIO_THRESHOLD  1.20
-#define MOTION_CONFIRM_FRAMES   3
+#define MOTION_CONFIRM_FRAMES   1
 
 /* -----------------------------------------------------------------
  * 연결 타임아웃

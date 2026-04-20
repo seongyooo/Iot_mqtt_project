@@ -310,7 +310,7 @@ static void on_mqtt_connect(struct mosquitto *mosq, void *ud, int rc)
     printf("[MQTT] 연결됨: %s (%s)\n",
            BROKERS[g_broker_idx].host, BROKERS[g_broker_idx].label);
 
-    mosquitto_subscribe(mosq, NULL, TOPIC_ALL, 1);
+    mosquitto_subscribe(mosq, NULL, TOPIC_ALL, 2);
 
     /* 연결된 Core 브로커를 브라우저에 알림 */
     char json[128];
